@@ -1,18 +1,20 @@
-# NPC Behavior Bridge 0.6.6
+# NPC Behavior Bridge 0.6.7
 
 NPC Behavior Bridge is an SKSE plugin that restores selected NPC base-record gameplay changes when later plugins revert them to baseline values.
 
 It follows three steps:
 
 1. Read the configured fields and compare their vanilla and configured baseline values.
-2. Follow load order and select each field's last value that differs from both baselines.
+2. Follow load order and select each field's last value that differs from both baselines. If none exists and the final value reverts to vanilla, use the configured baseline when it differs from vanilla.
 3. Restore that value when later records revert to either baseline.
 
 It does not invent schedules or combat behavior. AI Overhaul and USSEP are optional; no mod-name whitelist is used. Lists are selected whole rather than merged entry by entry. The default configuration uses USSEP as an additional baseline, falling back when unavailable.
 
 The plugin handles enabled gameplay fields, template inheritance, related stat calculation and supported script attachments. It protects appearance, race, voice and outfits; restoring a gameplay template may change an inherited name. Base fields are processed once after game data loads. Subsequent save/load, waiting and location checks do not repeatedly force the values back.
 
-This repository contains the source corresponding to **0.6.6**, build instructions, pinned dependency submodules and license notices. Local test fixtures, game data, sampling reports, deployment paths, runtime configuration and binary packages are not included. Use the configuration files supplied with the matching mod release.
+This repository contains the source corresponding to **0.6.7**, build instructions, pinned dependency submodules and license notices. Local test fixtures, game data, sampling reports, deployment paths, runtime configuration and binary packages are not included. Use the configuration files supplied with the matching mod release.
+
+See [CHANGELOG.md](CHANGELOG.md) for release notes.
 
 ## Building
 
@@ -36,7 +38,7 @@ If using a downloaded source ZIP, run `python tools/prepare_dependencies.py` fir
 
 Requires matching SKSE and Address Library installations and the Microsoft Visual C++ x64 runtime. VR and unlisted versions are unsupported. The 14-version address/layout and loader checks are offline validation; in-game sampling was performed on Steam 1.6.1170.
 
-Destructible data is tracked but not written. Unresolved leveled-template branches and invalid references are skipped. Existing script-instance preservation has been observed in game; missing-instance creation and save persistence have not yet been verified in game.
+Destructible data is tracked but not written. Unresolved leveled-template branches and invalid references are skipped. Existing script-instance preservation has been observed in game. In 0.6.7, Lydia's missing WIDeadBodyCleanupScript was created and bound successfully, its properties were verified, and the single instance persisted after saving, fully restarting the game and loading that save on Steam 1.6.1170. This does not establish support for arbitrary scripts, custom OnInit handlers or array properties; execution of the death-cleanup event was not tested.
 
 ## License
 

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(NPCBehaviorBridge VERSION 0.6.6 LANGUAGES C CXX)
+project(NPCBehaviorBridge VERSION 0.6.7 LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 option(NBB_BUILD_PLUGIN "Build the SKSE plugin (explicit Steam/GOG runtime list)" ON)

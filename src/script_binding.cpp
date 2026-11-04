@@ -80,6 +80,16 @@ bool hasOnInit(RE::BSScript::ObjectTypeInfo* type) {
     return false;
 }
 
+RE::BSScript::ObjectTypeInfo* nativeType(VM* vm, RE::BSScript::ObjectTypeInfo* type, RE::VMTypeID& id) {
+    auto* found = nativeAncestor(type, [&](auto* candidate) {
+        require(candidate->IsLinkedValid(), "Object property class is not linked");
+        return vm->GetTypeIDForScriptObject(candidate->GetName(), id);
+    }, [](auto* candidate) { return candidate->GetParent(); });
+    require(found && id < static_cast<RE::VMTypeID>(RE::FormType::Max),
+        "Object property has no native TESForm ancestor");
+    return found;
+}
+
 Variable makeValue(VM* vm, const Json& spec, const RE::BSScript::TypeInfo& declared) {
     auto type = spec.at("type").get<int>();
     require(type >= 1 && type <= 5, "Array properties are not supported by the first script adapter");
@@ -93,17 +103,26 @@ Variable makeValue(VM* vm, const Json& spec, const RE::BSScript::TypeInfo& decla
         auto* declaredClass = declared.GetTypeInfo();
         require(declaredClass, "Object property has no declared class");
         RE::VMTypeID nativeID{};
-        require(vm->GetTypeIDForScriptObject(declaredClass->GetName(), nativeID), "Object property native type unavailable");
+        auto* nativeClass = nativeType(vm, declaredClass, nativeID);
         auto* handles = vm->GetObjectHandlePolicy();
         auto handle = handles->GetHandleForObject(form->GetFormType(), form);
         require(handle != handles->EmptyHandle() && handles->HandleIsType(nativeID, handle), "Property object has the wrong native type");
-        // Use the same native-form wrapping path as CommonLib Papyrus arguments.
-        Variable wrapped;
-        RE::BSScript::PackHandle(&wrapped, form, static_cast<RE::VMTypeID>(form->GetFormType()));
-        require(wrapped.IsObject() && wrapped.GetObject(), "Could not wrap script property form");
+        auto propertyObject = propertyBinding(nativeClass == declaredClass, [&] {
+            Object existing;
+            vm->FindBoundObject(handle, declaredClass->GetName(), existing);
+            return existing;
+        }, [&] {
+            Variable wrapped;
+            RE::BSScript::PackHandle(&wrapped, form, static_cast<RE::VMTypeID>(form->GetFormType()));
+            require(wrapped.IsObject() && wrapped.GetObject(), "Could not wrap script property form");
+            return Object(wrapped.GetObject());
+        });
+        require(propertyObject->GetHandle() == handle,
+            "Property script instance belongs to a different Form");
         Object casted;
         Type destination(declaredClass);
-        require(vm->CastObject(wrapped.GetObject(), destination, casted) && casted, "Property object cannot be cast to declared class");
+        require(vm->CastObject(propertyObject, destination, casted) && casted && casted->GetHandle() == handle,
+            "Property object cannot be cast to declared class on the same Form");
         result.SetObject(casted, declared.GetRawType());
     } else if (type == 2) result.SetString(value.get<std::string>());
     else if (type == 3) result.SetSInt(value.get<std::int32_t>());
@@ -121,8 +140,7 @@ Json inspectValue(VM* vm, const Variable& value) {
         auto object = value.GetObject();
         if (!object) return nullptr;
         auto* type = object->GetTypeInfo(); RE::VMTypeID nativeID{};
-        require(type && vm->GetTypeIDForScriptObject(type->GetName(), nativeID) && nativeID > 0 &&
-            nativeID < static_cast<RE::VMTypeID>(RE::FormType::Max), "Property object is not a native TESForm");
+        nativeType(vm, type, nativeID);
         auto* form = static_cast<RE::TESForm*>(object->Resolve(nativeID));
         require(form, "Property object cannot resolve to a native form");
         return keyOf(form);
@@ -196,10 +214,9 @@ Json bindOne(VM* vm, RE::VMHandle handle, const std::string& script, const Json&
       }, [&] {
         Type type;
         require(vm->GetScriptObjectType(script.c_str(), type) && type && type->IsLinkedValid(), "Script PEX cannot be loaded/linked");
-        RE::VMTypeID nativeID{};
-        require(vm->GetTypeIDForScriptObject(script.c_str(), nativeID) &&
-            vm->GetObjectHandlePolicy()->HandleIsType(nativeID, handle) && vm->TypeCanBeBound(script.c_str(), handle),
-            "Script cannot bind to this Actor");
+        // The engine checks the native ancestor against this handle. Looking
+        // up the custom script name directly would reject valid Actor scripts.
+        require(vm->TypeCanBeBound(script.c_str(), handle), "Engine rejected script/Actor type compatibility: " + script);
         require(spec.at("status").get<int>() == 0, "Unsupported VMAD script status");
         require(!hasOnInit(type.get()), "Custom OnInit requires a separately verified initialization adapter");
         std::map<std::string, Variable> values;
@@ -207,7 +224,8 @@ Json bindOne(VM* vm, RE::VMHandle handle, const std::string& script, const Json&
             auto* info = propertyType(type.get(), name);
             require(info && info->autoVarIndex != UINT32_MAX, "Missing or non-auto script property: " + name);
             require(property.at("status").get<int>() == 1, "Unsupported VMAD property status");
-            values.emplace(name, makeValue(vm, property, info->type));
+            try { values.emplace(name, makeValue(vm, property, info->type)); }
+            catch (const std::exception& e) { throw std::runtime_error("Property " + name + ": " + e.what()); }
         }
         auto& item = pending[token];
         if (!item.object) {

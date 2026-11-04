@@ -417,6 +417,13 @@ Json makePlan(const std::vector<Plugin>& inputs,const Json& config,const Sequenc
                 if(value!=baseline->fields.at(field) && value!=originalBaseline->fields.at(field)) selected[field]=npc;
             }
         }
+        // A configured baseline also supplies the fallback when its correction
+        // was reverted to the official value. A nonbaseline candidate still wins.
+        if(customBaseline && !baseline->deleted) for(const auto& field:enabled) {
+            if(baseline->fields.at(field)!=originalBaseline->fields.at(field) &&
+               final->fields.at(field)==originalBaseline->fields.at(field))
+                selected.try_emplace(field,baseline);
+        }
         std::string reason;
         for(auto& entry:exclusionReport) {
             auto rule=entry.at("rule").get<std::string>();

@@ -720,7 +720,7 @@ void message(SKSE::MessagingInterface::Message* msg) {
 }
 }
 extern "C" __declspec(dllexport) constinit SKSE::PluginVersionData SKSEPlugin_Version=[] {
-    SKSE::PluginVersionData v; v.PluginVersion({0,6,6,0}); v.PluginName("NPCBehaviorBridge"); v.AuthorName("ROSVER");
+    SKSE::PluginVersionData v; v.PluginVersion({0,6,7,0}); v.PluginName("NPCBehaviorBridge"); v.AuthorName("ROSVER");
     // As in WingFlight: generic/version-selected struct support, not the
     // post-629-only flag (older AE SKSE rejects that bit). V5 is set by CLib.
     v.UsesAddressLibrary(); v.UsesNoStructs();
@@ -730,7 +730,7 @@ extern "C" __declspec(dllexport) constinit SKSE::PluginVersionData SKSEPlugin_Ve
 }();
 extern "C" __declspec(dllexport) bool SKSEPlugin_Query(const SKSE::QueryInterface* skse,SKSE::PluginInfo* info) {
     if(!skse || !info) return false;
-    info->infoVersion=SKSE::PluginInfo::kVersion; info->name="NPCBehaviorBridge"; info->version=REL::Version(0,6,6,0).pack();
+    info->infoVersion=SKSE::PluginInfo::kVersion; info->name="NPCBehaviorBridge"; info->version=REL::Version(0,6,7,0).pack();
     auto v=skse->RuntimeVersion();
     return !skse->IsEditor() && nbb::runtime::selectSKSE(v[0],v[1],v[2],v[3]);
 }
@@ -746,7 +746,7 @@ extern "C" __declspec(dllexport) bool SKSEPlugin_Load(const SKSE::LoadInterface*
         auto fileVersion=REL::Module::get().version();
         require(nbb::runtime::selectFile(fileVersion[0],fileVersion[1],fileVersion[2],fileVersion[3])==hostRuntime,
             "Executable file version and SKSE/store identity disagree");
-        SKSE::log::info("NPC Behavior Bridge 0.6.6; runtime={} store={} SKSE-store-type={} Address-Library-format={}; script creation/save persistence still need in-game validation",
+        SKSE::log::info("NPC Behavior Bridge 0.6.7 (r2 script binding); runtime={} store={} SKSE-store-type={} Address-Library-format={}; script creation/save persistence still need in-game validation",
             hostRuntime->name,hostRuntime->store==1?"GOG":"Steam",hostRuntime->store,nbb::runtime::addressFormat(*hostRuntime));
         return SKSE::GetMessagingInterface()->RegisterListener(message);
     } catch(...) { return false; }
