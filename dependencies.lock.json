@@ -1,0 +1,50 @@
+{
+  "schema": 1,
+  "dependencies": [
+    {
+      "directory": "CommonLibSSE-NG",
+      "repository": "https://github.com/alandtse/CommonLibSSE-NG.git",
+      "commit": "94faaed0c60eddd8347767f2d4d29a97c93bde8c",
+      "source_archive": "https://github.com/alandtse/CommonLibSSE-NG/archive/94faaed0c60eddd8347767f2d4d29a97c93bde8c.zip"
+    },
+    {
+      "directory": "zlib",
+      "repository": "https://github.com/madler/zlib.git",
+      "commit": "51b7f2abdade71cd9bb0e7a373ef2610ec6f9daf",
+      "source_archive": "https://github.com/madler/zlib/archive/51b7f2abdade71cd9bb0e7a373ef2610ec6f9daf.zip"
+    },
+    {
+      "directory": "json",
+      "repository": "https://github.com/nlohmann/json.git",
+      "commit": "9cca280a4d0ccf0c08f47a99aa71d1b0e52f8d03",
+      "source_archive": "https://github.com/nlohmann/json/archive/9cca280a4d0ccf0c08f47a99aa71d1b0e52f8d03.zip"
+    },
+    {
+      "directory": "spdlog",
+      "repository": "https://github.com/gabime/spdlog.git",
+      "commit": "27cb4c76708608465c413f6d0e6b8d99a4d84302",
+      "source_archive": "https://github.com/gabime/spdlog/archive/27cb4c76708608465c413f6d0e6b8d99a4d84302.zip"
+    },
+    {
+      "directory": "rapidcsv",
+      "repository": "https://github.com/d99kris/rapidcsv.git",
+      "commit": "a98b85e663114b8fdc9c0dc03abf22c296f38241",
+      "source_archive": "https://github.com/d99kris/rapidcsv/archive/a98b85e663114b8fdc9c0dc03abf22c296f38241.zip"
+    },
+    {
+      "directory": "DirectXTK",
+      "repository": "https://github.com/microsoft/DirectXTK.git",
+      "commit": "5a8f5d01cc1328e6451b588617c9985fa5a2a8ab",
+      "source_archive": "https://github.com/microsoft/DirectXTK/archive/5a8f5d01cc1328e6451b588617c9985fa5a2a8ab.zip"
+    }
+  ],
+  "nested_dependencies": [
+    {
+      "parent": "CommonLibSSE-NG",
+      "path": "extern/openvr",
+      "repository": "https://github.com/ValveSoftware/openvr.git",
+      "commit": "60eb187801956ad277f1cae6680e3a410ee0873b",
+      "note": "Pinned by CommonLib; initialized by recursive submodule checkout. Bridge builds SE/AE with VR disabled."
+    }
+  ]
+}

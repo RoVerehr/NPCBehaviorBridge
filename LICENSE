@@ -1,0 +1,19 @@
+NPC Behavior Bridge
+Copyright (C) 2026 ROSVER
+
+NPC Behavior Bridge's original software source code, command-line tool,
+and the combined NPCBehaviorBridge.dll are licensed under GNU GPL version 3
+or, at your option, any later version.
+See COPYING for the full license text. The additional permissions in
+EXCEPTIONS.md apply to NPC Behavior Bridge's covered code under GPL section 7.
+The Modded Code includes Skyrim and the proprietary hardware-driver SDKs
+listed by CommonLibSSE-NG; the Modding Libraries include SKSE and Windows.
+
+You may use, modify and redistribute this software under those terms,
+including commercial redistribution. Preserve copyright/license notices and
+provide the Corresponding Source when distributing covered binaries.
+No separate personal permission from ROSVER is required for these rights.
+
+Third-party code retains its copyright and applicable license notices.
+This software license does not relicense Skyrim or third-party mods,
+meshes, textures, sounds, animations, or other game assets.

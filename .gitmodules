@@ -1,0 +1,23 @@
+[submodule "vendor/CommonLibSSE-NG"]
+	path = vendor/CommonLibSSE-NG
+	url = https://github.com/alandtse/CommonLibSSE-NG.git
+
+[submodule "vendor/zlib"]
+	path = vendor/zlib
+	url = https://github.com/madler/zlib.git
+
+[submodule "vendor/json"]
+	path = vendor/json
+	url = https://github.com/nlohmann/json.git
+
+[submodule "vendor/spdlog"]
+	path = vendor/spdlog
+	url = https://github.com/gabime/spdlog.git
+
+[submodule "vendor/rapidcsv"]
+	path = vendor/rapidcsv
+	url = https://github.com/d99kris/rapidcsv.git
+
+[submodule "vendor/DirectXTK"]
+	path = vendor/DirectXTK
+	url = https://github.com/microsoft/DirectXTK.git
