@@ -4,6 +4,8 @@
 #include "nbb/runtime_normalization.hpp"
 #include "nbb/field_catalog.hpp"
 #include "nbb/inheritance.hpp"
+#include "nbb/diagnostics.hpp"
+#include "nbb/report.hpp"
 #include <Windows.h>
 #include <spdlog/sinks/basic_file_sink.h>
 #include <array>
@@ -25,6 +27,7 @@ static_assert(std::to_underlying(RE::ACTOR_BASE_DATA::TEMPLATE_USE_FLAG::kAIPack
 std::filesystem::path output;
 Json plan,layout;
 bool initialized=false;
+bool debugOutput=false;
 std::atomic<std::uint32_t> samplingReady{0};
 std::atomic<std::uint64_t> samplingEpoch{0};
 std::map<std::uint32_t,std::string> origins;
@@ -388,9 +391,10 @@ void freezeInheritance(const std::set<std::string>& only) {
     capture.insert(nbb::statInputs.begin(),nbb::statInputs.end());for(auto f:{"SkillValues","Health","Magicka","Stamina"})capture.insert(f);
     for(std::size_t i=0;i<plan["npcs"].size();++i) {
         auto& row=plan["npcs"][i];auto k=row["npc"].get<std::string>();inheritanceRows[k]=i;
-        if(row.at("inheritance_record").at("writable").get<bool>()&&(only.empty()||only.contains(k)))inheritanceScope.insert(k);
+        if(k!="skyrim.esm:000007" && row.at("inheritance_record").at("writable").get<bool>()&&(only.empty()||only.contains(k)))inheritanceScope.insert(k);
         try {
             auto* npc=static_cast<RE::TESNPC*>(resolve(k,RE::FormType::NPC));inheritanceObjects[k]=npc;
+            if(const auto* name=npc->GetName())row["display_name"]=name;
             Json node={{"flags",npc->actorData.templateUseFlags.underlying()},{"template",reference(npc->baseTemplateForm)},{"values",Json::object()}};
             for(auto& f:capture)try{node["values"][f]=readField(npc,f);}catch(const std::exception& ex){node["errors"][f]=ex.what();}
             try{node["calculated"]=statPrediction(npc,node["values"]);}catch(const std::exception& ex){node["calculation_error"]=ex.what();}
@@ -444,6 +448,7 @@ void planInheritedFields(Json& row,bool apply) {
 void prepareAndApply(Json& row,bool apply) {
     if(row.at("status")!="ready") return;
     auto* npc=static_cast<RE::TESNPC*>(resolve(row.at("npc"),RE::FormType::NPC));
+    if(npc->GetFormID()==0x7) {row["runtime_status"]="skipped_player";row["reason"]="Player base record is always excluded";return;}
     const auto& fields=row.at("fields");Json before=Json::object(),results=Json::object(),active=Json::object(),normalizations=Json::object();
     for(auto& [field,spec]:fields.items()) {
         if(spec.at("status")!="ready") {results[field]={{"status","skipped_plan"},{"reason",spec.at("reason")}};continue;}
@@ -603,6 +608,11 @@ void prepareAndApply(Json& row,bool apply) {
     require(!apply||matches,"Immediate post-write verification failed");
 }
 
+void debugReport(const char* name,const Json& data,bool append=false) {
+    try {nbb::diagnostics::writeReport(debugOutput,output/name,data,append);}
+    catch(const std::exception& e) {SKSE::log::error("Diagnostic output failed: {}",e.what());}
+}
+
 void verify(const std::string& phase) {
     if(plan.is_null()) return;
     Json rows=Json::array(); unsigned failures=0,checked=0;
@@ -613,13 +623,21 @@ void verify(const std::string& phase) {
             for(auto& [field,baseline]:row.at("runtime_after").items()) {
                 const auto& spec=row.at("fields").at(field);
                 auto actual=readField(npc,field); ++checked;
-                if(actual!=baseline) { ++failures; rows.push_back({{"npc",row.at("npc")},{"field",field},{"baseline",baseline},{"actual",actual},{"expected",spec.at("expected")}}); }
+                if(actual!=baseline) {
+                    ++failures;
+                    if(debugOutput) rows.push_back({{"npc",row.at("npc")},{"field",field},{"baseline",baseline},{"actual",actual},{"expected",spec.at("expected")}});
+                    if(phase=="data_loaded") SKSE::log::error("Startup verification mismatch: NPC {} field {}; expected={}, actual={}",row.at("npc").get<std::string>(),field,baseline.dump(),actual.dump());
+                }
             }
-        } catch(const std::exception& e) {++failures; rows.push_back({{"npc",row.at("npc")},{"error",e.what()}});}
+        } catch(const std::exception& e) {
+            ++failures; rows.push_back({{"npc",row.at("npc")},{"error",e.what()}});
+            SKSE::log::error("Verification {}: NPC {}: {}",phase,row.at("npc").get<std::string>(),e.what());
+        }
     }
     Json event={{"phase",phase},{"sequence",++verification},{"fields_checked",checked},{"changed_or_errors",failures},{"details",rows},{"mode",plan.at("mode")}};
-    std::ofstream stream(output/"NPCBehaviorBridge-verification.jsonl",std::ios::app); stream<<event.dump()<<'\n';
-    SKSE::log::info("Verification {}: {} fields, {} changes/errors; read-only",phase,checked,failures);
+    debugReport("NPCBehaviorBridge-verification.jsonl",event,true);
+    if(debugOutput) SKSE::log::info("Verification {}: {} fields, {} differences/read failures; read-only",phase,checked,failures);
+    else if(phase=="data_loaded") SKSE::log::info("Startup verification: {} fields checked; {} differences/read failures",checked,failures);
 }
 class MenuEvents final:public RE::BSTEventSink<RE::MenuOpenCloseEvent> {
 public:
@@ -639,6 +657,10 @@ MenuEvents menuEvents;
 void initialize() {
     if(initialized) return; initialized=true;
     auto config=nbb::readJson("Data/SKSE/Plugins/NPCBehaviorBridge.json");
+    nbb::validateConfig(config); debugOutput=config.value("debug",false);
+    if(debugOutput) spdlog::set_pattern("[%Y-%m-%d %H:%M:%S] [%l] [%s:%#] %v");
+    nbb::diagnostics::resetReports(output,[](const std::string& error){SKSE::log::error("Cannot clear previous diagnostic report: {}",error);});
+    SKSE::log::info("Mode: {}; debug: {}",config.at("mode").get<std::string>(),debugOutput);
     const auto exclusionPath=std::filesystem::path("Data/SKSE/Plugins/NPCBehaviorBridge.exclude.txt");
     auto exclusions=nbb::readExclusions(exclusionPath);
     auto manifest=manifestFromRuntime(); plan=nbb::run(manifest,config,exclusions);
@@ -679,7 +701,12 @@ void initialize() {
     for(auto& [k,index]:inheritanceRows)try {process(k);} catch(const std::exception& e) {plan["npcs"][index]["inheritance_error"]=e.what();plan["npcs"][index]["runtime_status"]="skipped_inheritance_dependency";}
     frozenInheritance=Json();projectedInheritance=Json();inheritanceObjects.clear();inheritanceRows.clear();inheritanceScope.clear();
     Json statuses=Json::object();
+    unsigned restoredNpcs=0,restoredFields=0,errorNpcs=0;
     for(auto& row:plan.at("npcs")) {
+        const auto result=nbb::diagnostics::npcResult(row);
+        restoredFields+=result.restored;restoredNpcs+=result.restored!=0;errorNpcs+=!result.errors.empty();
+        if(result.errors.empty()) SKSE::log::info("{}",result.line);
+        else {SKSE::log::error("{}",result.line);for(const auto& error:result.errors) SKSE::log::error("NPC {}: {}",row.at("npc").get<std::string>(),error);}
         auto status=row.value("runtime_status",row.at("status").get<std::string>());
         if(!statuses.contains(status)) statuses[status]=0;
         statuses[status]=statuses[status].get<unsigned>()+1;
@@ -697,13 +724,16 @@ void initialize() {
     }
     layout["coverage"]["field_statuses"]=fieldStatuses;
     plan["runtime_coverage"]=layout.at("coverage");
-    nbb::writeJson(output/"NPCBehaviorBridge-runtime.json",plan);
+    debugReport("NPCBehaviorBridge-runtime.json",plan);
+    try {nbb::report::write(debugOutput,output/"NPCBehaviorBridge-report.html",plan);}
+    catch(const std::exception& e) {SKSE::log::error("HTML report failed: {}",e.what());}
     layout["selected_sources"]=plan.at("selected_sources");
     layout["source_evidence"]=plan.at("plugins");
-    nbb::writeJson(output/"NPCBehaviorBridge-sampling.json",layout);
+    debugReport("NPCBehaviorBridge-sampling.json",layout);
     nbb::scripts::configure(plan,nbb::Sequence(only.begin(),only.end()),output);
     if(auto* ui=RE::UI::GetSingleton()) ui->AddEventSink(&menuEvents);
-    SKSE::log::info("{} runtime coverage: {}",apply?"Apply":"Audit",layout.at("coverage").dump());
+    if(debugOutput) SKSE::log::info("{} runtime coverage: {}",apply?"Apply":"Audit",layout.at("coverage").dump());
+    SKSE::log::info("{} complete: {} NPCs checked; {} fields restored on {} NPCs; {} base records with errors",apply?"Apply":"Audit",plan.at("npcs").size(),restoredFields,restoredNpcs,errorNpcs);
     verify("data_loaded");
 }
 void message(SKSE::MessagingInterface::Message* msg) {
@@ -720,7 +750,7 @@ void message(SKSE::MessagingInterface::Message* msg) {
 }
 }
 extern "C" __declspec(dllexport) constinit SKSE::PluginVersionData SKSEPlugin_Version=[] {
-    SKSE::PluginVersionData v; v.PluginVersion({0,6,7,0}); v.PluginName("NPCBehaviorBridge"); v.AuthorName("ROSVER");
+    SKSE::PluginVersionData v; v.PluginVersion({0,6,8,0}); v.PluginName("NPCBehaviorBridge"); v.AuthorName("ROSVER");
     // As in WingFlight: generic/version-selected struct support, not the
     // post-629-only flag (older AE SKSE rejects that bit). V5 is set by CLib.
     v.UsesAddressLibrary(); v.UsesNoStructs();
@@ -730,7 +760,7 @@ extern "C" __declspec(dllexport) constinit SKSE::PluginVersionData SKSEPlugin_Ve
 }();
 extern "C" __declspec(dllexport) bool SKSEPlugin_Query(const SKSE::QueryInterface* skse,SKSE::PluginInfo* info) {
     if(!skse || !info) return false;
-    info->infoVersion=SKSE::PluginInfo::kVersion; info->name="NPCBehaviorBridge"; info->version=REL::Version(0,6,7,0).pack();
+    info->infoVersion=SKSE::PluginInfo::kVersion; info->name="NPCBehaviorBridge"; info->version=REL::Version(0,6,8,0).pack();
     auto v=skse->RuntimeVersion();
     return !skse->IsEditor() && nbb::runtime::selectSKSE(v[0],v[1],v[2],v[3]);
 }
@@ -742,12 +772,13 @@ extern "C" __declspec(dllexport) bool SKSEPlugin_Load(const SKSE::LoadInterface*
         SKSE::Init(skse); auto directory=SKSE::log::log_directory(); if(!directory) return false; output=*directory;
         auto sink=std::make_shared<spdlog::sinks::basic_file_sink_mt>((output/"NPCBehaviorBridge.log").string(),true);
         spdlog::set_default_logger(std::make_shared<spdlog::logger>("NPCBehaviorBridge",sink)); spdlog::flush_on(spdlog::level::info);
-        std::ofstream(output/"NPCBehaviorBridge-verification.jsonl",std::ios::trunc);
+        spdlog::set_pattern("[%Y-%m-%d %H:%M:%S] [%l] %v");
         auto fileVersion=REL::Module::get().version();
         require(nbb::runtime::selectFile(fileVersion[0],fileVersion[1],fileVersion[2],fileVersion[3])==hostRuntime,
             "Executable file version and SKSE/store identity disagree");
-        SKSE::log::info("NPC Behavior Bridge 0.6.7 (r2 script binding); runtime={} store={} SKSE-store-type={} Address-Library-format={}; script creation/save persistence still need in-game validation",
+        SKSE::log::info("NPC Behavior Bridge 0.6.8; runtime={} store={} SKSE-store-type={} Address-Library-format={}",
             hostRuntime->name,hostRuntime->store==1?"GOG":"Steam",hostRuntime->store,nbb::runtime::addressFormat(*hostRuntime));
         return SKSE::GetMessagingInterface()->RegisterListener(message);
-    } catch(...) { return false; }
+    } catch(const std::exception& e) {SKSE::log::error("Bridge load failed: {}",e.what());return false;}
+      catch(...) {SKSE::log::error("Bridge load failed: unknown exception");return false;}
 }

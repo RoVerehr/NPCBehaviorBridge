@@ -1,4 +1,4 @@
-# NPC Behavior Bridge 0.6.7
+# NPC Behavior Bridge 0.6.8
 
 NPC Behavior Bridge is an SKSE plugin that restores selected NPC base-record gameplay changes when later plugins revert them to baseline values.
 
@@ -12,7 +12,9 @@ It does not invent schedules or combat behavior. AI Overhaul and USSEP are optio
 
 The plugin handles enabled gameplay fields, template inheritance, related stat calculation and supported script attachments. It protects appearance, race, voice and outfits; restoring a gameplay template may change an inherited name. Base fields are processed once after game data loads. Subsequent save/load, waiting and location checks do not repeatedly force the values back.
 
-This repository contains the source corresponding to **0.6.7**, build instructions, pinned dependency submodules and license notices. Local test fixtures, game data, sampling reports, deployment paths, runtime configuration and binary packages are not included. Use the configuration files supplied with the matching mod release.
+This repository contains the source corresponding to **0.6.8**, build instructions, pinned dependency submodules and license notices. Local test fixtures, game data, sampling reports, deployment paths, runtime configuration and binary packages are not included. Use the configuration files supplied with the matching mod release.
+
+The player is always excluded. Set `"debug": true` in the release configuration to generate detailed diagnostics and `NPCBehaviorBridge-report.html`, a searchable startup snapshot in the SKSE log directory. Debug mode is off by default; normal logging retains per-NPC outcomes and errors. Each game launch replaces the log and clears old diagnostic reports.
 
 See [CHANGELOG.md](CHANGELOG.md) for release notes.
 

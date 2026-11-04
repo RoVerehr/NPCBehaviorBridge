@@ -1,5 +1,6 @@
 #include "nbb/script_binding.hpp"
 #include "nbb/script_lifecycle.hpp"
+#include "nbb/diagnostics.hpp"
 #include <atomic>
 #include <fstream>
 #include <set>
@@ -24,6 +25,13 @@ std::filesystem::path reportPath;
 std::atomic<bool> active{false};
 std::atomic<std::uint64_t> generation{0};
 bool apply = false;
+bool debugOutput = false;
+std::map<Token, std::string> reportedResults;
+
+void debugReport(const std::filesystem::path& path,const Json& data,bool append=false) {
+    try {diagnostics::writeReport(debugOutput,path,data,append);}
+    catch(const std::exception& e) {SKSE::log::error("Script diagnostic output failed: {}",e.what());}
+}
 
 void require(bool ok, const std::string& message) { if (!ok) throw std::runtime_error(message); }
 
@@ -263,6 +271,7 @@ Json bindOne(VM* vm, RE::VMHandle handle, const std::string& script, const Json&
 
 void process(RE::Actor* actor, const std::string& phase, bool mayCreate) {
     if (!active.load() || !actor || actor->IsDeleted() || !actor->GetActorBase()) return;
+    if(actor->GetFormID()==0x14 || actor->GetActorBase()->GetFormID()==0x7) return;
     auto found = targets.find(actor->GetActorBase()->GetFormID());
     if (found == targets.end()) return;
     Json record{{"phase", phase}, {"generation", generation.load()}, {"mode", apply ? "apply" : "audit"},
@@ -286,8 +295,22 @@ void process(RE::Actor* actor, const std::string& phase, bool mayCreate) {
             catch (const std::exception& e) { record["scripts"][script] = {{"status", "inspection_error"}, {"reason", e.what()}}; }
         }
     } catch (const std::exception& e) { record["error"] = e.what(); }
-    std::ofstream stream(reportPath, std::ios::app); stream << record.dump() << '\n';
-    SKSE::log::info("Script bindings {} actor {:08X}: {}", phase, actor->GetFormID(), record.at("scripts").dump());
+    debugReport(reportPath,record,true);
+    for(const auto& error:diagnostics::scriptErrors(record))
+        SKSE::log::error("NPC {} actor {:08X} script {}: {}",found->second.key,actor->GetFormID(),phase,error);
+    if(debugOutput) SKSE::log::info("Script bindings {} actor {:08X}: {}",phase,actor->GetFormID(),record.at("scripts").dump());
+    else for(const auto& [name,spec]:record.at("scripts").items()) {
+        const auto status=spec.value("status",std::string("unknown"));
+        if(diagnostics::isError(status)) continue; // already logged, never suppress errors
+        auto outcome=status;
+        if(spec.contains("properties_match_source") && !spec.at("properties_match_source").get<bool>()) outcome+="; existing property values preserved";
+        if(spec.contains("reason")) outcome+="; "+spec.at("reason").get<std::string>();
+        const Token token{record.value("actor_vm_handle",RE::VMHandle{}),lower(name)};
+        if(reportedResults[token]!=outcome) {
+            SKSE::log::info("NPC {} actor {:08X} script {}: {}",found->second.key,actor->GetFormID(),name,outcome);
+            reportedResults[token]=outcome;
+        }
+    }
 }
 
 void queueSweep(const std::string& phase, bool mayCreate) {
@@ -322,8 +345,9 @@ ObjectEvents events;
 
 void configure(const Json& plan, const Sequence& only, const std::filesystem::path& output) {
     targets.clear(); origins.clear(); apply = plan.at("mode") == "apply";
+    debugOutput=plan.value("debug",false);reportedResults.clear();
     reportPath = output / "NPCBehaviorBridge-script-bindings.jsonl";
-    std::ofstream(reportPath, std::ios::trunc);
+    // Reports were cleared once at process initialization, not on save loads.
     auto* data = RE::TESDataHandler::GetSingleton();
     for (auto* file : data->files) if (file && file->compileIndex != 0xff) {
         auto index = file->IsLight() ? 0xfe000u | file->smallFileCompileIndex : file->compileIndex;
@@ -332,6 +356,7 @@ void configure(const Json& plan, const Sequence& only, const std::filesystem::pa
     Json configured = Json::array();
     for (const auto& row : plan.at("npcs")) {
         auto key = row.at("npc").get<std::string>();
+        if(key=="skyrim.esm:000007") continue;
         if (row.at("status") != "ready" || (!only.empty() && std::find(only.begin(), only.end(), key) == only.end())) continue;
         if (!row.at("fields").contains("VMAD")) continue;
         const auto& field = row.at("fields").at("VMAD");
@@ -342,16 +367,19 @@ void configure(const Json& plan, const Sequence& only, const std::filesystem::pa
             for (const auto& [name, _] : field.at("disk").items()) diskScripts.insert(lower(name));
             targets.emplace(form->GetFormID(), Target{key, field.at("expected"), field.at("sources"), std::move(diskScripts)});
             configured.push_back({{"npc", key}, {"status", "pending_actor_binding"}, {"expected", field.at("expected")}, {"sources", field.at("sources")}});
-        } catch (const std::exception& e) { configured.push_back({{"npc", key}, {"status", "configuration_error"}, {"reason", e.what()}}); }
+        } catch (const std::exception& e) {
+            configured.push_back({{"npc", key}, {"status", "configuration_error"}, {"reason", e.what()}});
+            SKSE::log::error("NPC {} script target configuration: {}",key,e.what());
+        }
     }
-    writeJson(output / "NPCBehaviorBridge-script-targets.json", {{"mode", plan.at("mode")}, {"targets", configured},
+    debugReport(output / "NPCBehaviorBridge-script-targets.json", {{"mode", plan.at("mode")}, {"targets", configured},
         {"scope", "Missing Actor instances only; existing script state is preserved; NPC base VMAD metadata is not modified"}});
     RE::ScriptEventSourceHolder::GetSingleton()->AddEventSink(&events);
 }
 
 void beforeLoad() {
     active.store(false); generation.fetch_add(1);
-    pending.clear(); failed.clear();
+    pending.clear(); failed.clear();reportedResults.clear();
 }
 void afterLoad(const std::string& phase) {
     beforeLoad(); active.store(true); queueSweep(phase, true);

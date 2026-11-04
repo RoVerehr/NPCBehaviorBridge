@@ -338,8 +338,9 @@ Sequence readExclusions(const std::filesystem::path& path) {
 }
 void validateConfig(const Json& config) {
     require(config.at("schema")==2,"Config schema 2 required: replace the old AIO-specific configuration");
-    const std::set<std::string> keys{"schema","mode","fields","only_npcs","baseline"};
+    const std::set<std::string> keys{"schema","mode","fields","only_npcs","baseline","debug"};
     for(auto& [key,_]:config.items()) require(keys.contains(key),"Unknown configuration key: "+key);
+    require(!config.contains("debug") || config.at("debug").is_boolean(),"debug must be true or false");
     auto mode=config.at("mode").get<std::string>(); require(mode=="audit"||mode=="apply","mode must be audit or apply");
     auto baseline=lower(config.value("baseline",std::string()));
     require(baseline.empty() || ((baseline.ends_with(".esp")||baseline.ends_with(".esm")||baseline.ends_with(".esl")) && baseline.find_first_of("\\/:")==std::string::npos),"baseline must be a plugin filename or an empty string");
@@ -432,6 +433,7 @@ Json makePlan(const std::vector<Plugin>& inputs,const Json& config,const Sequenc
             }
         }
 
+        if(key=="skyrim.esm:000007") reason="Player base record is always excluded";
         bool excluded=!reason.empty();
         if(reason.empty() && final->deleted) reason="Final NPC is deleted";
         if(reason.empty() && baseline->deleted) reason="Baseline NPC is deleted";
@@ -491,7 +493,7 @@ Json makePlan(const std::vector<Plugin>& inputs,const Json& config,const Sequenc
         else if(applicable) {++ready;if(changes) {++changedNpcs;changedFields+=changes;}}
 
     }
-    return {{"schema",2},{"strategy","last_nonbaseline_field"},{"baseline_comparison","official_and_configured"},{"configuration_warnings",configurationWarnings(config)},{"mode",config.at("mode")},
+    return {{"schema",2},{"debug",config.value("debug",false)},{"strategy","last_nonbaseline_field"},{"baseline_comparison","official_and_configured"},{"configuration_warnings",configurationWarnings(config)},{"mode",config.at("mode")},
         {"runtime_adapter_limits",Json::array({{{"field","Destructible"},{"reason","Tracked, but destruction model/preload ownership is not yet implemented for runtime writes"}}})},{"baseline",baselineInfo},{"enabled_fields",enabled},{"requested_fields",config.at("fields")},{"selected_sources",sourceNames},{"exclusions",exclusionReport},{"plugins",evidence},{"npcs",rows},
         {"summary",{{"scanned_npcs",rows.size()},{"eligible_npcs",ready},{"npcs_needing_changes",changedNpcs},{"fields_needing_changes",changedFields},{"skipped_or_excluded_npcs",skipped},{"eligible_fields",eligibleFields},{"skipped_fields",skippedFields}}}};
 }
