@@ -9,7 +9,11 @@ namespace nbb::diagnostics {
 inline constexpr std::array reportNames{
     "NPCBehaviorBridge-runtime.json", "NPCBehaviorBridge-sampling.json",
     "NPCBehaviorBridge-script-bindings.jsonl", "NPCBehaviorBridge-script-targets.json",
-    "NPCBehaviorBridge-verification.jsonl", "NPCBehaviorBridge-report.html"};
+    "NPCBehaviorBridge-verification.jsonl", "NPCBehaviorBridge-report.html",
+    // Remove leftover files from pre-release capture experiments, too.
+    "NPCBehaviorBridge-load-probe.jsonl", "NPCBehaviorBridge-early-prototype.json",
+    "NPCBehaviorBridge-early-all.json", "NPCBehaviorBridge-early-all-audit.json",
+    "NPCBehaviorBridge-load-stream.json"};
 
 template<class Error> void resetReports(const std::filesystem::path& directory, Error error) {
     for (const auto* name : reportNames) {

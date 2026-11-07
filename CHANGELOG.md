@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7
+
+- Reduce startup overhead by capturing NPC records during the game's own loading and sharing one recovery plan.
+- Enable the loading optimization across all 14 supported Steam/GOG runtimes, with automatic disk fallback when capture cannot be used safely.
+- Reduce repeated template snapshots and stat calculations while keeping the existing restoration rules and script-state preservation.
+- Remove development probes and test-only reports; retain normal logging, timing, and optional debug/HTML reports.
+
 ## 0.6.8
 
 - Always exclude the player from NPC restoration and script binding.

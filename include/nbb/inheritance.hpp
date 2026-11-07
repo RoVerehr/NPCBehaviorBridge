@@ -5,7 +5,62 @@
 #include <functional>
 #include <cmath>
 #include <stdexcept>
+#include <set>
+#include <unordered_map>
+#include <array>
+#include <bit>
+#include <optional>
 namespace nbb {
+// Conservative connected closure of the OLD and PROPOSED runtime relationships.
+// Include untouched ancestors/siblings/descendants: a child's empty local plan
+// does not prove its final inherited contents will remain unchanged.
+inline std::set<std::string> inheritanceCaptureScope(const Json& rows,const Json& oldGraph,const Json& newGraph) {
+    std::map<std::string,std::set<std::string>> edges;
+    std::set<std::string> scope;
+    for(const auto& row:rows) {
+        auto key=row.at("npc").get<std::string>();edges[key];
+        if(!row.at("fields").empty()||row.contains("inheritance_error"))scope.insert(key);
+    }
+    for(const auto* graph:{&oldGraph,&newGraph}) for(auto& [key,node]:graph->items()) {
+        edges[key];const auto& parent=node.at("template");
+        if(parent.is_null())continue;
+        auto target=parent.get<std::string>();edges[key].insert(target);edges[target].insert(key);
+        if(!graph->contains(target))scope.insert(key); // Unresolved/LVLN branches retain full checks.
+    }
+    // Preserve full diagnostics for cycles and excessive chains as well.
+    for(const auto* graph:{&oldGraph,&newGraph}) for(auto& [start,_]:graph->items()) {
+        std::set<std::string> seen;auto key=start;
+        for(unsigned depth=0;graph->contains(key);++depth) {
+            if(depth>=128||!seen.insert(key).second){scope.insert(start);break;}
+            const auto& parent=graph->at(key).at("template");if(parent.is_null())break;
+            key=parent.get<std::string>();
+        }
+    }
+    std::vector<std::string> pending(scope.begin(),scope.end());
+    while(!pending.empty()) {
+        auto key=std::move(pending.back());pending.pop_back();
+        for(const auto& neighbor:edges[key])if(scope.insert(neighbor).second)pending.push_back(neighbor);
+    }
+    return scope;
+}
+struct RemainingInheritanceWork {
+    std::set<std::string> affected,capture;
+};
+// Changes flow to descendants. Ancestors needed only as frozen providers do not
+// make their other children dirty: expanding them bidirectionally repeats work.
+inline RemainingInheritanceWork remainingInheritanceWork(const std::set<std::string>& pending,const Json& before,const Json& after) {
+    std::map<std::string,std::set<std::string>> children,parents;
+    for(const auto* graph:{&before,&after})for(auto& [key,node]:graph->items()) {
+        const auto& parent=node.at("template");if(parent.is_null())continue;
+        auto p=parent.get<std::string>();children[p].insert(key);parents[key].insert(p);
+    }
+    RemainingInheritanceWork work;work.affected=pending;
+    std::vector<std::string> queue(pending.begin(),pending.end());
+    for(std::size_t i=0;i<queue.size();++i)for(const auto& child:children[queue[i]])if(work.affected.insert(child).second)queue.push_back(child);
+    work.capture=work.affected;queue.assign(work.capture.begin(),work.capture.end());
+    for(std::size_t i=0;i<queue.size();++i)for(const auto& parent:parents[queue[i]])if(work.capture.insert(parent).second)queue.push_back(parent);
+    return work;
+}
 inline unsigned inheritanceBit(const std::string& f) {
     static const std::map<std::string,unsigned> bits{
         {"DeathItem",0}, // Functional member of Traits; appearance remains excluded.
@@ -34,6 +89,55 @@ inline std::string inheritedProvider(const std::string& start,unsigned bit,const
     }
     throw std::runtime_error("Excessive template chain");
 }
+// Numeric edges avoid repeated FormKey/JSON lookups while walking a template chain.
+// Only relationships are indexed; runtime field values still use the original snapshots.
+class InheritanceIndex {
+    static constexpr std::size_t absent=std::size_t(-1);
+    struct Node {std::string key,parentKey;unsigned flags{};std::size_t parent=absent;bool hasParent{};};
+    std::vector<Node> nodes;
+    std::unordered_map<std::string,std::size_t> indices;
+public:
+    void build(const Json& graph) {
+        nodes.clear();indices.clear();nodes.reserve(graph.size());indices.reserve(graph.size());
+        for(auto& [key,_]:graph.items()){indices.emplace(key,nodes.size());nodes.push_back(Node{key});}
+        for(auto& [key,node]:graph.items())update(key,node.at("flags").get<unsigned>(),node.at("template"));
+    }
+    void update(const std::string& key,unsigned flags,const Json& parent) {
+        auto found=indices.find(key);if(found==indices.end())return;
+        auto& node=nodes[found->second];node.flags=flags;node.hasParent=!parent.is_null();
+        node.parentKey=node.hasParent?parent.get<std::string>():std::string();
+        auto target=indices.find(node.parentKey);node.parent=target==indices.end()?absent:target->second;
+    }
+    std::string provider(const std::string& start,unsigned bit) const {
+        auto found=indices.find(start);auto index=found==indices.end()?absent:found->second;
+        const std::string* key=&start;std::array<std::size_t,128> seen{};
+        for(unsigned depth=0;depth<seen.size();++depth) {
+            if(index==absent)throw std::runtime_error("Unresolved or leveled NPC template: "+*key);
+            if(std::find(seen.begin(),seen.begin()+depth,index)!=seen.begin()+depth)throw std::runtime_error("Cyclic template chain");
+            seen[depth]=index;const auto& node=nodes[index];
+            if(!(node.flags&bit)||!node.hasParent)return node.key;
+            index=node.parent;key=&node.parentKey;
+        }
+        throw std::runtime_error("Excessive template chain");
+    }
+    void clear(){nodes.clear();indices.clear();}
+};
+struct PreparedInheritanceFields {
+    struct Entry {std::string name;unsigned bit;bool inheritedName;};
+    std::set<std::string> enabled;
+    std::vector<Entry> entries;
+    explicit PreparedInheritanceFields(const Json& fields) {
+        for(const auto& field:fields)enabled.insert(field.get<std::string>());
+        auto names=enabled;names.insert("InheritedName");names.insert("InheritedShortName");
+        for(const auto& name:names)if(auto bit=inheritanceBit(name);bit&&name!="VMAD"&&!calculatedField(name))
+            entries.push_back({name,bit,name=="InheritedName"||name=="InheritedShortName"});
+    }
+};
+struct InheritanceContext {
+    InheritanceIndex frozen,projected;
+    PreparedInheritanceFields fields;
+    InheritanceContext(const Json& before,const Json& after,const Json& enabled):fields(enabled){frozen.build(before);projected.build(after);}
+};
 inline Json distributeStats(Json values,const Json& weights,int points,int cap) {
     auto w=weights.get<std::vector<int>>();std::vector<unsigned> order(w.size());std::iota(order.begin(),order.end(),0);
     std::sort(order.begin(),order.end(),[&](auto a,auto b){return w[a]==w[b]?a>b:w[a]>w[b];});
@@ -59,6 +163,33 @@ inline Json calculateStats(const Json& input) {
         throw std::runtime_error("Final automatic attribute outside writable range");
     return {{"SkillValues",skills},{"Health",hms[0]},{"Magicka",hms[1]},{"Stamina",hms[2]}};
 }
+// Per-initialization cache of successful calculations only. Keys contain every
+// numeric input actually consumed by calculateStats, not NPC/race/class names.
+struct StatPredictionCache {
+    std::unordered_map<std::string,Json> results;
+    std::size_t hits{},misses{};
+    Json calculate(const Json& input) {
+        auto key=input.dump();auto found=results.find(key);
+        if(found!=results.end()){++hits;return found->second;}
+        ++misses;auto result=calculateStats(input);results.emplace(std::move(key),result);return result;
+    }
+    void clear(){results.clear();hits=misses=0;}
+};
+// Only providers whose parent-first processing has finished are reusable. Never
+// cache failed reads or pre-commit values; finalizing again invalidates old data.
+struct FinalizedProviderValues {
+    std::set<std::string> finalized;
+    std::map<std::string,std::map<std::string,Json>> values;
+    std::size_t hits{},reads{};
+    void finalize(const std::string& key){values.erase(key);finalized.insert(key);}
+    template<class Read> Json get(const std::string& key,const std::string& field,Read read) {
+        if(!finalized.contains(key)){++reads;return read();}
+        auto& fields=values[key];auto found=fields.find(field);
+        if(found!=fields.end()){++hits;return found->second;}
+        ++reads;auto value=read();return fields.emplace(field,std::move(value)).first->second;
+    }
+    void clear(){finalized.clear();values.clear();hits=reads=0;}
+};
 inline bool permitsValue(const Json& actual,const Json& spec) {
     return spec.value("status",std::string())=="ready" && (actual==spec.at("disk")||actual==spec.at("expected")||
         (spec.contains("inherited_old_value")&&actual==spec.at("inherited_old_value")));
@@ -71,27 +202,81 @@ inline void addInheritedField(Json& row,const std::string& field,const Json& exp
     spec["inherited_old_value"]=oldValue;spec["inheritance_provider"]=provider;
     row["fields"][field]=std::move(spec);row["status"]="ready";row["reason"]="";
 }
+inline bool needsNativeFallback(const Json& row,bool automatic,const InheritanceIndex& oldGraph,const InheritanceIndex& newGraph,
+    const std::function<Json(const std::string&,const std::string&)>& read,
+    const std::function<bool(const std::string&)>& canCopyAttack) {
+    if(row.at("status")!="ready")return false;auto key=row.at("npc").get<std::string>();
+    std::array<std::optional<std::string>,13> oldSources,newSources;
+    auto provider=[&](unsigned bit,bool projected)->const std::string& {auto& cached=(projected?newSources:oldSources).at(std::countr_zero(bit));if(!cached)cached=(projected?newGraph:oldGraph).provider(key,bit);return *cached;};
+    for(auto& [f,spec]:row.at("fields").items()) {
+        if(spec.at("status")!="ready"||f=="VMAD"||f=="Destructible"||(automatic&&calculatedField(f)))continue;
+        auto actual=read(key,f);Json effective=spec.at("expected");
+        if(auto bit=inheritanceBit(f)) {
+            const auto& source=provider(bit,false);const auto& next=provider(bit,true);
+            if(source!=next)return true;
+            if(source!=key) {
+                if((f=="AttackRace"||f=="AttackData")&&!canCopyAttack(source))continue;
+                effective=read(source,f);
+            }
+        }
+        if(actual!=effective)return true;
+    }
+    return false;
+}
+// For branches proven to have no pending local or ancestor writes. Preserve
+// inherited candidate metadata without recalculating already-final engine stats.
+inline void settleInheritedFields(Json& row,bool automatic,const InheritanceIndex& graph,
+    const std::function<Json(const std::string&,const std::string&)>& read,
+    const std::function<bool(const std::string&)>& canCopyAttack) {
+    if(row.at("status")!="ready")return;auto key=row.at("npc").get<std::string>();
+    std::array<std::optional<std::string>,13> sources;
+    std::vector<std::string> fields;for(auto& [f,_]:row["fields"].items())fields.push_back(f);
+    for(const auto& f:fields){auto& spec=row["fields"][f];if(spec.at("status")!="ready"||f=="VMAD"||f=="Destructible")continue;
+        if(automatic&&calculatedField(f)){spec["status"]="skipped";spec["reason"]="Automatic stats; plugin cache not restored";continue;}
+        auto bit=inheritanceBit(f);if(!bit)continue;
+        auto& cached=sources.at(std::countr_zero(bit));if(!cached)cached=graph.provider(key,bit);const auto& source=*cached;if(source==key)continue;
+        if((f=="AttackRace"||f=="AttackData")&&!canCopyAttack(source)) {
+            row["inheritance_notes"][f]="Race-default attack map retained for child race";spec["status"]="skipped";spec["reason"]="Inherited attack map uses race default; child race retained";continue;
+        }
+        auto actual=read(key,f),parent=read(source,f);
+        if(actual!=parent)throw std::runtime_error("Settled inheritance proof changed");
+        addInheritedField(row,f,parent,parent,source);
+    }
+}
 inline void planInheritedFields(Json& row,const Json& enabled,const Json& frozenInheritance,const Json& projectedInheritance,
     const std::function<Json(const std::string&,const std::string&)>& read,
-    const std::function<Json(const Json&)>& calculate,const std::function<bool(const std::string&)>& canCopyAttack) {
+    const std::function<Json(const Json&)>& calculate,const std::function<bool(const std::string&)>& canCopyAttack,
+    const InheritanceContext* context=nullptr) {
     auto k=row["npc"].get<std::string>();if(!frozenInheritance.contains(k))return;
     const auto& old=frozenInheritance.at(k);const auto& now=projectedInheritance.at(k);
-    std::set<std::string> fields;for(auto& f:enabled)fields.insert(f);
+    // Scoped to this NPC: the parent-first caller may commit graph changes between NPCs.
+    std::array<std::optional<std::string>,13> oldProviders,newProviders;
+    const auto provider=[&](unsigned bit,bool projected)->const std::string& {
+        auto& cached=(projected?newProviders:oldProviders).at(std::countr_zero(bit));
+        if(!cached)cached=context?(projected?context->projected:context->frozen).provider(k,bit):inheritedProvider(k,bit,projected?projectedInheritance:frozenInheritance);
+        return *cached;
+    };
+    std::optional<PreparedInheritanceFields> localFields;if(!context)localFields.emplace(enabled);
+    const auto& prepared=context?context->fields:*localFields;
+    const auto& fields=prepared.enabled;
     // Names are only a consequence of a permitted template change, never config fields.
-    if(now["template"]!=old["template"] || (now["flags"].get<unsigned>()&128)) {fields.insert("InheritedName");fields.insert("InheritedShortName");}
-    for(auto& f:fields) {
-        auto bit=nbb::inheritanceBit(f);if(!bit||f=="VMAD"||nbb::calculatedField(f))continue;
+    const bool includeNames=now["template"]!=old["template"] || (now["flags"].get<unsigned>()&128);
+    auto& selected=row["fields"];const auto& oldValues=old.at("values");
+    const auto& diskValues=row.at("inheritance_record").at("fields");
+    for(const auto& entry:prepared.entries) {
+        if(entry.inheritedName&&!includeNames&&!fields.contains(entry.name))continue;
+        const auto& f=entry.name;auto bit=entry.bit;
         try {
-            auto oldSource=nbb::inheritedProvider(k,bit,frozenInheritance);
-            auto source=nbb::inheritedProvider(k,bit,projectedInheritance);
-            auto actual=old.at("values").at(f);auto original=old.at("values").at(f);
-            if(oldSource!=k) original=frozenInheritance.at(oldSource).at("values").at(f);
+            const auto& oldSource=provider(bit,false);
+            const auto& source=provider(bit,true);
+            const auto& actual=oldValues.at(f);
+            const auto& original=oldSource!=k?frozenInheritance.at(oldSource).at("values").at(f):actual;
             bool oldCopied=oldSource!=k&&actual==original;
-            bool hasLocal=row["fields"].contains(f)&&row["fields"][f]["status"]=="ready";
+            const auto local=selected.find(f);bool hasLocal=local!=selected.end()&&local->at("status")=="ready";
             if(source==k) {
                 if(oldSource==k)continue;
-                if(!hasLocal && !row["inheritance_record"]["fields"].contains(f)){row["inheritance_notes"][f]="Local value unavailable after detaching template";continue;}
-                auto value=hasLocal?row["fields"][f]["expected"]:row["inheritance_record"]["fields"][f];
+                if(!hasLocal && !diskValues.contains(f)){row["inheritance_notes"][f]="Local value unavailable after detaching template";continue;}
+                const auto& value=hasLocal?local->at("expected"):diskValues.at(f);
                 if(oldCopied)addInheritedField(row,f,value,original,k);
                 continue;
             }
@@ -103,7 +288,7 @@ inline void planInheritedFields(Json& row,const Json& enabled,const Json& frozen
             }
             // A parent's actual verified contents supersede the child's local copy.
             // Never accept an unexplained child runtime modification as a baseline.
-            auto disk=row["inheritance_record"]["fields"].value(f,Json());
+            const Json nullValue;auto diskIt=diskValues.find(f);const auto& disk=diskIt==diskValues.end()?nullValue:*diskIt;
             if(oldCopied || actual==disk || actual==value) addInheritedField(row,f,value,oldCopied?original:disk,source);
             else {row["inheritance_notes"][f]="Runtime value differs from old inherited contents; preserved";
                 if(hasLocal)row["fields"][f]["status"]="skipped",row["fields"][f]["reason"]="Unexplained runtime change during inheritance synchronization";}
@@ -113,11 +298,15 @@ inline void planInheritedFields(Json& row,const Json& enabled,const Json& frozen
         }
     }
     // Recalculate only when accepted stat inputs change, using the child's race.
-    auto values=old.at("values");bool changed=false;
+    // The stat calculator only consumes these inputs, not inventories, spells or packages.
+    Json values=Json::object();for(const auto& f:statInputs)if(old.at("values").contains(f))values[f]=old.at("values").at(f);
+    bool changed=false;
     for(auto& f:nbb::statInputs) if(row["fields"].contains(f)&&values.contains(f)&&permitsValue(values[f],row["fields"][f])) {changed|=values[f]!=row["fields"][f]["expected"];values[f]=row["fields"][f]["expected"];}
     if(values.value("AutoCalcStats",false)) {
         try {
-            auto calculated=calculate(values);
+            // Race, class records and GMSTs are not modified by this synchronous pass.
+            // Reuse a successful frozen prediction only while all calculation inputs agree.
+            auto calculated=!changed&&old.contains("calculated")?old.at("calculated"):calculate(values);
             if(changed) for(auto f:{"SkillValues","Health","Magicka","Stamina"}) if(fields.contains(f)) {
                 bool wasAuto=old.at("values").value("AutoCalcStats",false);
                 auto proof=wasAuto?(old.contains("calculated")?old["calculated"].value(f,Json()):Json()):row["inheritance_record"]["fields"].value(f,Json());
@@ -138,7 +327,7 @@ inline void planInheritedFields(Json& row,const Json& enabled,const Json& frozen
         // Leaving automatic stats restores local or inherited caches, but only
         // when the previous calculated value can be reproduced independently.
         for(auto f:{"SkillValues","Health","Magicka","Stamina"})if(fields.contains(f))try {
-            auto source=nbb::inheritedProvider(k,2,projectedInheritance);auto previous=nbb::inheritedProvider(k,2,frozenInheritance);
+            const auto& source=provider(2,true);const auto& previous=provider(2,false);
             auto before=frozenInheritance.at(previous).at("values").at(f);
             bool leavingAuto=old.at("values").value("AutoCalcStats",false);
             if(leavingAuto) {if(!old.contains("calculated"))throw std::runtime_error("Old automatic value unavailable");before=old.at("calculated").at(f);}

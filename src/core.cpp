@@ -12,6 +12,9 @@
 #include <span>
 #include <stdexcept>
 #include <cmath>
+#include <chrono>
+#include <atomic>
+#include <thread>
 
 namespace nbb {
 const Sequence fieldNames=[] {auto names=legacyFieldNames;for(const auto& f:scalarFields) names.push_back(f.name);for(const auto& f:referenceFields) names.push_back(f.name);
@@ -53,12 +56,36 @@ std::vector<Sub> subrecords(std::span<const std::uint8_t> b) {
     }
     require(!extended,"Dangling XXXX"); return out;
 }
-Bytes readAt(std::ifstream& stream, std::uint64_t offset, std::size_t count) {
-    Bytes result(count); stream.seekg(static_cast<std::streamoff>(offset));
-    stream.read(reinterpret_cast<char*>(result.data()),static_cast<std::streamsize>(count));
-    require(bool(stream),"File read failed at "+std::to_string(offset)); return result;
-}
-Bytes payload(std::ifstream& stream,std::uint64_t p,std::uint32_t size,std::uint32_t flags) {
+// Small record headers share a bounded read window instead of seeking/allocating
+// for every header. Views last until the next read; decoded payloads own their bytes.
+class PluginReader {
+    std::ifstream stream;
+    std::uint64_t length{},begin{};
+    std::size_t available{};
+    std::array<std::uint8_t,65536> window{};
+    Bytes large;
+public:
+    explicit PluginReader(const std::filesystem::path& path):stream(path,std::ios::binary) {
+        require(bool(stream),"Cannot open "+path.string());length=std::filesystem::file_size(path);
+    }
+    std::uint64_t size() const {return length;}
+    std::span<const std::uint8_t> read(std::uint64_t offset,std::size_t count) {
+        require(offset<=length && count<=length-offset,"File read failed at "+std::to_string(offset));
+        if(offset>=begin && offset-begin<=available && count<=available-static_cast<std::size_t>(offset-begin))
+            return std::span<const std::uint8_t>(window).subspan(static_cast<std::size_t>(offset-begin),count);
+        stream.clear();stream.seekg(static_cast<std::streamoff>(offset));
+        if(count>window.size()) {
+            large.resize(count);stream.read(reinterpret_cast<char*>(large.data()),static_cast<std::streamsize>(count));
+            require(bool(stream),"File read failed at "+std::to_string(offset));return large;
+        }
+        available=static_cast<std::size_t>(std::min<std::uint64_t>(window.size(),length-offset));begin=offset;
+        stream.read(reinterpret_cast<char*>(window.data()),static_cast<std::streamsize>(available));
+        require(bool(stream),"File read failed at "+std::to_string(offset));
+        return std::span<const std::uint8_t>(window).first(count);
+    }
+};
+std::span<const std::uint8_t> readAt(PluginReader& stream,std::uint64_t offset,std::size_t count) {return stream.read(offset,count);}
+Bytes payload(PluginReader& stream,std::uint64_t p,std::uint32_t size,std::uint32_t flags) {
     require(size<=maxRecord,"Record exceeds safety limit");
     auto data=readAt(stream,p,size);
     if(flags&0x40000) {
@@ -68,7 +95,7 @@ Bytes payload(std::ifstream& stream,std::uint64_t p,std::uint32_t size,std::uint
         require(result==Z_OK && actual==expected && compressed==data.size()-4,"Invalid compressed record");
         return inflated;
     }
-    return data;
+    return Bytes(data.begin(),data.end());
 }
 bool contains(const Sequence& s,const std::string& value) { return std::find(s.begin(),s.end(),value)!=s.end(); }
 void uniqueSequence(const Sequence& values) {
@@ -138,8 +165,10 @@ std::string lower(std::string text) { for(auto& c:text) if(c>='A'&&c<='Z') c=cha
 std::string formKey(std::uint32_t raw,const Sequence& names) {
     if(raw==0) return {};
     auto idx=raw>>24; require(idx<names.size(),"FormID has invalid master index");
-    std::ostringstream out; out<<lower(names[idx])<<':'<<std::hex<<std::setw(6)<<std::setfill('0')<<(raw&0xffffff);
-    return out.str();
+    auto result=lower(names[idx]);result.push_back(':');
+    constexpr char hex[]="0123456789abcdef";
+    for(int shift=20;shift>=0;shift-=4)result.push_back(hex[(raw>>shift)&15]);
+    return result;
 }
 std::string hashFile(const std::filesystem::path& path) {
     BCRYPT_ALG_HANDLE algorithm{}; BCRYPT_HASH_HANDLE hash{};
@@ -162,11 +191,117 @@ void writeJson(const std::filesystem::path& path,const Json& data) {
     std::ofstream out(path,std::ios::trunc); require(bool(out),"Cannot write "+path.string());
     out<<data.dump(2)<<'\n'; out.flush(); require(bool(out),"JSON write failed");
 }
-Plugin readPlugin(const std::filesystem::path& path,std::string name) {
+Npc parseNpcRecord(std::span<const std::uint8_t> data,const std::string& key,const std::string& pluginName,
+    const Sequence& names,std::uint32_t flags) {
+    require(data.size()<=maxRecord,"NPC payload exceeds limit");
+    Npc npc; npc.key=key; npc.plugin=pluginName; npc.deleted=(flags&0x20)!=0; npc.ignored=(flags&0x1000)!=0;
+    npc.fields=emptyFields(); npc.observed=Json::object();
+    std::set<std::string> singleton;
+    std::optional<std::uint32_t> spellCount;
+    std::optional<std::uint32_t> itemCount,perkCount,keywordCount;
+    Json pendingAttack=nullptr;
+    for(auto& sub:subrecords(data)) {
+        auto& t=sub.type; auto v=sub.data;
+        for(const auto& sf:scalarFields) if(t==sf.tag) {
+            require(v.size()>=sf.diskOffset+sf.diskBytes,"Truncated scalar "+std::string(sf.name));
+            std::uint32_t raw=sf.diskBytes==4?u32(v,sf.diskOffset):sf.diskBytes==2?u16(v,sf.diskOffset):v[sf.diskOffset];
+            if(sf.diskMask) npc.fields[sf.name]=bool(raw&sf.diskMask);
+            else if(sf.boolean) npc.fields[sf.name]=bool(raw);
+            else if(sf.signedValue) npc.fields[sf.name]=static_cast<std::int16_t>(raw);
+            else npc.fields[sf.name]=raw;
+        }
+        for(const auto& rf:referenceFields) if(t==rf.tag) {
+            require(v.size()==4,"Invalid reference field");auto k=formKey(u32(v,0),names);npc.fields[rf.name]=k.empty()?Json(nullptr):Json(k);
+        }
+        if(t=="DNAM") { require(v.size()==52,"Invalid DNAM");npc.fields["SkillOffsets"]=std::vector<std::uint8_t>(v.begin()+18,v.begin()+36); }
+        if(t=="PRKZ") {require(v.size()==4 && singleton.insert(t).second,"Invalid PRKZ");perkCount=u32(v,0);}
+        if(t=="PRKR") {require(v.size()==8,"Invalid PRKR");auto k=formKey(u32(v,0),names);require(!k.empty(),"Null perk");npc.fields["Perks"].push_back(Json::array({k,static_cast<std::int8_t>(v[4])}));}
+        if(t=="KSIZ") {require(v.size()==4 && singleton.insert(t).second,"Invalid KSIZ");keywordCount=u32(v,0);}
+        if(t=="KWDA") {require(v.size()%4==0 && singleton.insert(t).second,"Invalid KWDA");for(unsigned j=0;j<v.size();j+=4){auto k=formKey(u32(v,j),names);require(!k.empty(),"Null keyword");npc.fields["Keywords"].push_back(k);}}
+        auto refAt=[&](unsigned offset)->Json {auto k=formKey(u32(v,offset),names);return k.empty()?Json(nullptr):Json(k);};
+        if(t=="ATKR") {require(v.size()==4 && singleton.insert(t).second,"Invalid ATKR");npc.fields["AttackRace"]=refAt(0);}
+        if(t=="ATKD") {
+            require(v.size()==44 && pendingAttack.is_null(),"Invalid ATKD/event pair");
+            pendingAttack={{"damage_mult",f32(v,0)},{"chance",f32(v,4)},{"spell",refAt(8)},{"flags",u32(v,12)},
+                {"attack_angle",f32(v,16)},{"strike_angle",f32(v,20)},{"stagger",f32(v,24)},{"type",refAt(28)},
+                {"knockdown",f32(v,32)},{"recovery",f32(v,36)},{"stamina_mult",f32(v,40)}};
+        }
+        if(t=="ATKE") {auto event=cstring(v);require(!pendingAttack.is_null() && !npc.fields["AttackData"].contains(event),"Unpaired/duplicate attack event");npc.fields["AttackData"][event]=pendingAttack;pendingAttack=nullptr;}
+        if(t=="DEST") {require(v.size()==8 && singleton.insert(t).second,"Invalid DEST");npc.fields["Destructible"]={{"health",u32(v,0)},{"count",v[4]},{"flags",v[5]},{"stages",Json::array()}};}
+        if(t=="DSTD") {require(v.size()==20 && !npc.fields["Destructible"].is_null(),"Invalid destruction stage");
+            npc.fields["Destructible"]["stages"].push_back({{"health_percent",v[0]},{"index",v[1]},{"model_stage",v[2]},{"flags",v[3]},
+                {"self_damage",u32(v,4)},{"explosion",refAt(8)},{"debris",refAt(12)},{"debris_count",u32(v,16)},{"model",Json::array()}});}
+        if(t=="DMDL"||t=="DMDT"||t=="DMDS") {
+            require(!npc.fields["Destructible"].is_null() && !npc.fields["Destructible"]["stages"].empty(),"Orphan destruction model");
+            npc.fields["Destructible"]["stages"].back()["model"].push_back({{"tag",t},{"raw",std::vector<std::uint8_t>(v.begin(),v.end())}});
+        }
+        if(t=="EDID") npc.editor=cstring(v);
+        if(t=="PKID") { require(v.size()==4,"Invalid PKID"); auto ref=formKey(u32(v,0),names); require(!ref.empty(),"Null package"); npc.fields[t].push_back(ref); }
+        if(t=="SPLO") { require(v.size()==4,"Invalid SPLO"); auto ref=formKey(u32(v,0),names); require(!ref.empty(),"Null spell"); npc.fields[t].push_back(ref); }
+        if(t=="SPCT") { require(v.size()==4 && singleton.insert(t).second,"Invalid/duplicate SPCT"); spellCount=u32(v,0); }
+        if(t=="DNAM") {
+            require(v.size()==52 && singleton.insert(t).second,"Unsupported/duplicate DNAM");
+            npc.fields["Magicka"]=u16(v,38); npc.fields["Stamina"]=u16(v,40);
+            npc.fields["SkillValues"]=std::vector<std::uint8_t>(v.begin(),v.begin()+18);
+        }
+        if(t=="SNAM") {
+            require(v.size()==8,"Invalid faction entry");auto ref=formKey(u32(v,0),names);require(!ref.empty(),"Null faction");
+            npc.fields["Factions"].push_back(Json::array({ref,static_cast<std::int8_t>(v[4])}));
+        }
+        if(t=="COCT") {require(v.size()==4 && singleton.insert(t).second,"Invalid COCT");itemCount=u32(v,0);}
+        if(t=="CNTO") {
+            require(v.size()==8,"Invalid inventory entry");auto ref=formKey(u32(v,0),names);require(!ref.empty(),"Null item");
+            npc.fields["Inventory"].push_back({{"item",ref},{"count",static_cast<std::int32_t>(u32(v,4))},{"extra",nullptr}});
+        }
+        if(t=="COED") {
+            require(v.size()==12 && !npc.fields["Inventory"].empty(),"Invalid container extra");
+            require(npc.fields["Inventory"].back()["extra"].is_null(),"Duplicate container extra");
+            auto raw=u32(v,4);Json candidate=nullptr;
+            if(raw && (raw>>24)<names.size()) candidate=formKey(raw,names);
+            npc.fields["Inventory"].back()["extra"]={{"owner",refAt(0)},{"condition_raw",raw},{"global_candidate",candidate},{"health",f32(v,8)}};
+        }
+        if(t=="VMAD") {
+            require(singleton.insert(t).second,"Duplicate VMAD");
+            try {npc.fields["VMAD"]=VmadReader{v,names}.parse();}
+            catch(const std::exception& e) {npc.fields["VMAD"]={{"unparsed",e.what()}};npc.observed["VMAD_parse_error"]=e.what();}
+        }
+        if(t=="SPOR"||t=="ECOR"||t=="OCOR"||t=="GWOR"||t=="DPLT"||t=="ZNAM"||t=="TPLT"||t=="RNAM") {
+            require(v.size()==4 && singleton.insert(t).second,"Invalid/duplicate "+t);
+            auto ref=formKey(u32(v,0),names); Json value=ref.empty()?Json(nullptr):Json(ref);
+            if(t=="ZNAM") npc.fields["CombatStyle"]=value;
+            else if(npc.fields.contains(t)) npc.fields[t]=value; else npc.observed[t]=value;
+        }
+        if(t=="AIDT") {
+            require(v.size()==20 && singleton.insert(t).second,"Unsupported/duplicate AIDT");
+            require(v[0]<=3 && v[1]<=4 && v[5]<=2,"Invalid AI parameter");
+            npc.fields["Aggression"]=v[0]; npc.fields["Confidence"]=v[1]; npc.fields["Assistance"]=v[5];
+        }
+        if(t=="ACBS") {
+            require(v.size()==24 && singleton.insert(t).second,"Unsupported/duplicate ACBS");npc.templateFlags=u16(v,18);
+            npc.fields["MagickaOffset"]=static_cast<std::int16_t>(u16(v,4));npc.fields["Protected"]=(u32(v,0)&0x800)!=0;
+            npc.fields["UseAIPackages"]=(npc.templateFlags&0x20)!=0;
+        }
+    }
+    if(!npc.deleted && !npc.ignored) require(singleton.contains("ACBS") && singleton.contains("AIDT") && singleton.contains("DNAM"),"NPC lacks ACBS/AIDT/DNAM");
+    require(pendingAttack.is_null(),"Unpaired ATKD");
+    require(perkCount.value_or(0)==npc.fields["Perks"].size(),"PRKZ/PRKR count mismatch");
+    require(keywordCount.value_or(0)==npc.fields["Keywords"].size(),"KSIZ/KWDA count mismatch");
+    if(!npc.fields["Destructible"].is_null()) require(npc.fields["Destructible"]["count"]==npc.fields["Destructible"]["stages"].size(),"DEST stage count mismatch");
+    for(auto f:{"Keywords","Perks"}) {require(npc.fields[f].size()<=4096,"Excessive functional list");std::sort(npc.fields[f].begin(),npc.fields[f].end());}
+    uniqueSequence(npc.fields["PKID"].get<Sequence>());
+    require(npc.fields["SPLO"].size()<=4096,"Excessive spell list");
+    require(spellCount.value_or(0)==npc.fields["SPLO"].size(),"SPCT/SPLO count mismatch");
+    auto spells=npc.fields["SPLO"].get<Sequence>(); std::ranges::sort(spells);
+    spells.erase(std::unique(spells.begin(),spells.end()),spells.end()); npc.fields["SPLO"]=spells;
+    require(itemCount.value_or(0)==npc.fields["Inventory"].size(),"COCT/CNTO count mismatch");
+    for(auto field:{"Factions","Inventory"}) {auto& list=npc.fields[field];require(list.size()<=4096,"Excessive list");std::sort(list.begin(),list.end());}
+    return npc;
+}
+Plugin readPlugin(const std::filesystem::path& path,std::string name,double* hashMilliseconds) {
     Plugin plugin; plugin.name=lower(name); plugin.path=path;
     require(lower(path.filename().string())==plugin.name,"Manifest name/path mismatch");
-    std::ifstream stream(path,std::ios::binary); require(bool(stream),"Cannot open "+path.string());
-    auto length=std::filesystem::file_size(path); require(length>=24,"Missing TES4 header");
+    PluginReader stream(path);
+    auto length=stream.size(); require(length>=24,"Missing TES4 header");
     auto head=readAt(stream,0,24); require(tag(head)=="TES4","First record is not TES4");
     auto size=u32(head,4); plugin.flags=u32(head,8);
     require(size<=length-24,"TES4 exceeds file boundary");
@@ -193,115 +328,19 @@ Plugin readPlugin(const std::filesystem::path& path,std::string name) {
             if(!(flags&0x1000)) plugin.types[key]=(flags&0x20)?"DELETED":type;
             if(type=="NPC_") {
                 require(!plugin.npcs.contains(key),"Duplicate NPC record in plugin");
-                Npc npc; npc.key=key; npc.plugin=plugin.name; npc.deleted=(flags&0x20)!=0; npc.ignored=(flags&0x1000)!=0;
-                npc.fields=emptyFields(); npc.observed=Json::object();
                 data=payload(stream,position+24,size,flags);
-                std::set<std::string> singleton;
-                std::optional<std::uint32_t> spellCount;
-                std::optional<std::uint32_t> itemCount,perkCount,keywordCount;
-                Json pendingAttack=nullptr;
-                for(auto& sub:subrecords(data)) {
-                    auto& t=sub.type; auto v=sub.data;
-                    for(const auto& sf:scalarFields) if(t==sf.tag) {
-                        require(v.size()>=sf.diskOffset+sf.diskBytes,"Truncated scalar "+std::string(sf.name));
-                        std::uint32_t raw=sf.diskBytes==4?u32(v,sf.diskOffset):sf.diskBytes==2?u16(v,sf.diskOffset):v[sf.diskOffset];
-                        if(sf.diskMask) npc.fields[sf.name]=bool(raw&sf.diskMask);
-                        else if(sf.boolean) npc.fields[sf.name]=bool(raw);
-                        else if(sf.signedValue) npc.fields[sf.name]=static_cast<std::int16_t>(raw);
-                        else npc.fields[sf.name]=raw;
-                    }
-                    for(const auto& rf:referenceFields) if(t==rf.tag) {
-                        require(v.size()==4,"Invalid reference field");auto k=formKey(u32(v,0),names);npc.fields[rf.name]=k.empty()?Json(nullptr):Json(k);
-                    }
-                    if(t=="DNAM") { require(v.size()==52,"Invalid DNAM");npc.fields["SkillOffsets"]=std::vector<std::uint8_t>(v.begin()+18,v.begin()+36); }
-                    if(t=="PRKZ") {require(v.size()==4 && singleton.insert(t).second,"Invalid PRKZ");perkCount=u32(v,0);}
-                    if(t=="PRKR") {require(v.size()==8,"Invalid PRKR");auto k=formKey(u32(v,0),names);require(!k.empty(),"Null perk");npc.fields["Perks"].push_back(Json::array({k,static_cast<std::int8_t>(v[4])}));}
-                    if(t=="KSIZ") {require(v.size()==4 && singleton.insert(t).second,"Invalid KSIZ");keywordCount=u32(v,0);}
-                    if(t=="KWDA") {require(v.size()%4==0 && singleton.insert(t).second,"Invalid KWDA");for(unsigned j=0;j<v.size();j+=4){auto k=formKey(u32(v,j),names);require(!k.empty(),"Null keyword");npc.fields["Keywords"].push_back(k);}}
-                    auto refAt=[&](unsigned offset)->Json {auto k=formKey(u32(v,offset),names);return k.empty()?Json(nullptr):Json(k);};
-                    if(t=="ATKR") {require(v.size()==4 && singleton.insert(t).second,"Invalid ATKR");npc.fields["AttackRace"]=refAt(0);}
-                    if(t=="ATKD") {
-                        require(v.size()==44 && pendingAttack.is_null(),"Invalid ATKD/event pair");
-                        pendingAttack={{"damage_mult",f32(v,0)},{"chance",f32(v,4)},{"spell",refAt(8)},{"flags",u32(v,12)},
-                            {"attack_angle",f32(v,16)},{"strike_angle",f32(v,20)},{"stagger",f32(v,24)},{"type",refAt(28)},
-                            {"knockdown",f32(v,32)},{"recovery",f32(v,36)},{"stamina_mult",f32(v,40)}};
-                    }
-                    if(t=="ATKE") {auto event=cstring(v);require(!pendingAttack.is_null() && !npc.fields["AttackData"].contains(event),"Unpaired/duplicate attack event");npc.fields["AttackData"][event]=pendingAttack;pendingAttack=nullptr;}
-                    if(t=="DEST") {require(v.size()==8 && singleton.insert(t).second,"Invalid DEST");npc.fields["Destructible"]={{"health",u32(v,0)},{"count",v[4]},{"flags",v[5]},{"stages",Json::array()}};}
-                    if(t=="DSTD") {require(v.size()==20 && !npc.fields["Destructible"].is_null(),"Invalid destruction stage");
-                        npc.fields["Destructible"]["stages"].push_back({{"health_percent",v[0]},{"index",v[1]},{"model_stage",v[2]},{"flags",v[3]},
-                            {"self_damage",u32(v,4)},{"explosion",refAt(8)},{"debris",refAt(12)},{"debris_count",u32(v,16)},{"model",Json::array()}});}
-                    if(t=="DMDL"||t=="DMDT"||t=="DMDS") {
-                        require(!npc.fields["Destructible"].is_null() && !npc.fields["Destructible"]["stages"].empty(),"Orphan destruction model");
-                        npc.fields["Destructible"]["stages"].back()["model"].push_back({{"tag",t},{"raw",std::vector<std::uint8_t>(v.begin(),v.end())}});
-                    }
-                    if(t=="EDID") npc.editor=cstring(v);
-                    if(t=="PKID") { require(v.size()==4,"Invalid PKID"); auto ref=formKey(u32(v,0),names); require(!ref.empty(),"Null package"); npc.fields[t].push_back(ref); }
-                    if(t=="SPLO") { require(v.size()==4,"Invalid SPLO"); auto ref=formKey(u32(v,0),names); require(!ref.empty(),"Null spell"); npc.fields[t].push_back(ref); }
-                    if(t=="SPCT") { require(v.size()==4 && singleton.insert(t).second,"Invalid/duplicate SPCT"); spellCount=u32(v,0); }
-                    if(t=="DNAM") {
-                        require(v.size()==52 && singleton.insert(t).second,"Unsupported/duplicate DNAM");
-                        npc.fields["Magicka"]=u16(v,38); npc.fields["Stamina"]=u16(v,40);
-                        npc.fields["SkillValues"]=std::vector<std::uint8_t>(v.begin(),v.begin()+18);
-                    }
-                    if(t=="SNAM") {
-                        require(v.size()==8,"Invalid faction entry");auto ref=formKey(u32(v,0),names);require(!ref.empty(),"Null faction");
-                        npc.fields["Factions"].push_back(Json::array({ref,static_cast<std::int8_t>(v[4])}));
-                    }
-                    if(t=="COCT") {require(v.size()==4 && singleton.insert(t).second,"Invalid COCT");itemCount=u32(v,0);}
-                    if(t=="CNTO") {
-                        require(v.size()==8,"Invalid inventory entry");auto ref=formKey(u32(v,0),names);require(!ref.empty(),"Null item");
-                        npc.fields["Inventory"].push_back({{"item",ref},{"count",static_cast<std::int32_t>(u32(v,4))},{"extra",nullptr}});
-                    }
-                    if(t=="COED") {
-                        require(v.size()==12 && !npc.fields["Inventory"].empty(),"Invalid container extra");
-                        require(npc.fields["Inventory"].back()["extra"].is_null(),"Duplicate container extra");
-                        auto raw=u32(v,4);Json candidate=nullptr;
-                        if(raw && (raw>>24)<names.size()) candidate=formKey(raw,names);
-                        npc.fields["Inventory"].back()["extra"]={{"owner",refAt(0)},{"condition_raw",raw},{"global_candidate",candidate},{"health",f32(v,8)}};
-                    }
-                    if(t=="VMAD") {
-                        require(singleton.insert(t).second,"Duplicate VMAD");
-                        try {npc.fields["VMAD"]=VmadReader{v,names}.parse();}
-                        catch(const std::exception& e) {npc.fields["VMAD"]={{"unparsed",e.what()}};npc.observed["VMAD_parse_error"]=e.what();}
-                    }
-                    if(t=="SPOR"||t=="ECOR"||t=="OCOR"||t=="GWOR"||t=="DPLT"||t=="ZNAM"||t=="TPLT"||t=="RNAM") {
-                        require(v.size()==4 && singleton.insert(t).second,"Invalid/duplicate "+t);
-                        auto ref=formKey(u32(v,0),names); Json value=ref.empty()?Json(nullptr):Json(ref);
-                        if(t=="ZNAM") npc.fields["CombatStyle"]=value;
-                        else if(npc.fields.contains(t)) npc.fields[t]=value; else npc.observed[t]=value;
-                    }
-                    if(t=="AIDT") {
-                        require(v.size()==20 && singleton.insert(t).second,"Unsupported/duplicate AIDT");
-                        require(v[0]<=3 && v[1]<=4 && v[5]<=2,"Invalid AI parameter");
-                        npc.fields["Aggression"]=v[0]; npc.fields["Confidence"]=v[1]; npc.fields["Assistance"]=v[5];
-                    }
-                    if(t=="ACBS") {
-                        require(v.size()==24 && singleton.insert(t).second,"Unsupported/duplicate ACBS");npc.templateFlags=u16(v,18);
-                        npc.fields["MagickaOffset"]=static_cast<std::int16_t>(u16(v,4));npc.fields["Protected"]=(u32(v,0)&0x800)!=0;
-                        npc.fields["UseAIPackages"]=(npc.templateFlags&0x20)!=0;
-                    }
-                }
-                if(!npc.deleted && !npc.ignored) require(singleton.contains("ACBS") && singleton.contains("AIDT") && singleton.contains("DNAM"),"NPC lacks ACBS/AIDT/DNAM");
-                require(pendingAttack.is_null(),"Unpaired ATKD");
-                require(perkCount.value_or(0)==npc.fields["Perks"].size(),"PRKZ/PRKR count mismatch");
-                require(keywordCount.value_or(0)==npc.fields["Keywords"].size(),"KSIZ/KWDA count mismatch");
-                if(!npc.fields["Destructible"].is_null()) require(npc.fields["Destructible"]["count"]==npc.fields["Destructible"]["stages"].size(),"DEST stage count mismatch");
-                for(auto f:{"Keywords","Perks"}) {require(npc.fields[f].size()<=4096,"Excessive functional list");std::sort(npc.fields[f].begin(),npc.fields[f].end());}
-                uniqueSequence(npc.fields["PKID"].get<Sequence>());
-                require(npc.fields["SPLO"].size()<=4096,"Excessive spell list");
-                require(spellCount.value_or(0)==npc.fields["SPLO"].size(),"SPCT/SPLO count mismatch");
-                auto spells=npc.fields["SPLO"].get<Sequence>(); std::ranges::sort(spells);
-                spells.erase(std::unique(spells.begin(),spells.end()),spells.end()); npc.fields["SPLO"]=spells;
-                require(itemCount.value_or(0)==npc.fields["Inventory"].size(),"COCT/CNTO count mismatch");
-                for(auto field:{"Factions","Inventory"}) {auto& list=npc.fields[field];require(list.size()<=4096,"Excessive list");std::sort(list.begin(),list.end());}
+                auto npc=parseNpcRecord(data,key,plugin.name,names,flags);
                 plugin.npcs.emplace(key,std::move(npc));
             }
         }
         position+=24+size;
     }
     require(position==length,"File boundary mismatch");
-    if(!plugin.npcs.empty()) plugin.sha256=hashFile(path);
+    if(!plugin.npcs.empty()) {
+        const auto started=std::chrono::steady_clock::now();
+        plugin.sha256=hashFile(path);
+        if(hashMilliseconds) *hashMilliseconds+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count();
+    }
     return plugin;
 }
 
@@ -362,11 +401,10 @@ Json configurationWarnings(const Json& config) {
         warnings.push_back({{"field",name},{"reason","Protected appearance/race/voice/name/outfit field ignored"}});
     return warnings;
 }
-Json makePlan(const std::vector<Plugin>& inputs,const Json& config,const Sequence& exclusions) {
+Json makePlan(std::vector<Plugin> plugins,const Json& config,const Sequence& exclusions) {
     validateConfig(config);
     // COED's second word is either a signed faction rank or a file-local global
     // reference. Resolve that union using the complete loaded form-type table.
-    auto plugins=inputs;
     std::map<std::string,std::string> ownerTypes;for(const auto& plugin:plugins) for(const auto& [key,type]:plugin.types) ownerTypes[key]=type;
     for(auto& plugin:plugins) for(auto& [key,npc]:plugin.npcs) if(npc.fields.contains("Inventory")) {
         for(auto& item:npc.fields["Inventory"]) {
@@ -484,29 +522,65 @@ Json makePlan(const std::vector<Plugin>& inputs,const Json& config,const Sequenc
         }
         auto status=excluded?"excluded":!reason.empty()?"skipped":fields.empty()?"no_source_changes":applicable?"ready":"skipped";
         if(reason.empty() && !fields.empty() && !applicable) reason="No applicable selected fields; see field reasons";
-        rows.push_back({{"npc",key},{"editor_id",final->editor},{"winner",final->plugin},{"baseline_plugin",baseline->plugin},
+        Json row={{"npc",key},{"editor_id",final->editor},{"winner",final->plugin},{"baseline_plugin",baseline->plugin},
             {"baseline_kind",customBaseline?"configured_plugin":officialBaseline?"official":"first_definition"},
             {"official_baseline_plugin",originalBaseline->plugin},{"official_baseline_kind",officialBaseline?"official":"first_definition"},
-            {"status",status},{"reason",reason},{"fields",fields},{"observed_only",final->observed},
-            {"inheritance_record",{{"flags",final->templateFlags},{"fields",final->fields},{"writable",!excluded&&!final->deleted&&!baseline->deleted}}}});
+            {"status",status},{"reason",reason},{"observed_only",final->observed},
+            {"inheritance_record",{{"flags",final->templateFlags},{"fields",final->fields},{"writable",!excluded&&!final->deleted&&!baseline->deleted}}}};
+        row["fields"]=std::move(fields);rows.push_back(std::move(row));
         if(status==std::string("skipped")||excluded) ++skipped;
         else if(applicable) {++ready;if(changes) {++changedNpcs;changedFields+=changes;}}
 
     }
-    return {{"schema",2},{"debug",config.value("debug",false)},{"strategy","last_nonbaseline_field"},{"baseline_comparison","official_and_configured"},{"configuration_warnings",configurationWarnings(config)},{"mode",config.at("mode")},
-        {"runtime_adapter_limits",Json::array({{{"field","Destructible"},{"reason","Tracked, but destruction model/preload ownership is not yet implemented for runtime writes"}}})},{"baseline",baselineInfo},{"enabled_fields",enabled},{"requested_fields",config.at("fields")},{"selected_sources",sourceNames},{"exclusions",exclusionReport},{"plugins",evidence},{"npcs",rows},
+    Json result={{"schema",2},{"debug",config.value("debug",false)},{"strategy","last_nonbaseline_field"},{"baseline_comparison","official_and_configured"},{"configuration_warnings",configurationWarnings(config)},{"mode",config.at("mode")},
+        {"runtime_adapter_limits",Json::array({{{"field","Destructible"},{"reason","Tracked, but destruction model/preload ownership is not yet implemented for runtime writes"}}})},{"baseline",baselineInfo},{"enabled_fields",enabled},{"requested_fields",config.at("fields")},{"selected_sources",sourceNames},{"exclusions",exclusionReport},{"plugins",evidence},
         {"summary",{{"scanned_npcs",rows.size()},{"eligible_npcs",ready},{"npcs_needing_changes",changedNpcs},{"fields_needing_changes",changedFields},{"skipped_or_excluded_npcs",skipped},{"eligible_fields",eligibleFields},{"skipped_fields",skippedFields}}}};
+    result["npcs"]=std::move(rows);return result;
 }
-Json run(const Json& manifest,const Json& config,const Sequence& exclusions) {
+Json run(const Json& manifest,const Json& config,const Sequence& exclusions,RunTimings* timings,
+    const std::function<void(const Plugin&)>& observer) {
+    using Clock=std::chrono::steady_clock;
+    if(timings) *timings={};
     validateConfig(config);
     require(manifest.at("schema")==1,"Unsupported manifest schema");
-    std::vector<Plugin> plugins;
-    for(auto& p:manifest.at("plugins")) {
-        auto utf8=p.at("path").get<std::string>();
-        auto path=std::filesystem::path(std::u8string(utf8.begin(),utf8.end()));
-        try { plugins.push_back(readPlugin(path,p.at("name").get<std::string>())); }
-        catch(const std::exception& e) { throw std::runtime_error(p.at("name").get<std::string>()+": "+e.what()); }
+    const auto& entries=manifest.at("plugins");
+    std::vector<Plugin> plugins(entries.size());
+    std::vector<std::exception_ptr> failures(entries.size());
+    std::vector<double> readTimes(entries.size()),hashTimes(entries.size()),observerTimes(entries.size());
+    std::atomic_size_t next{0};
+    const unsigned workers=static_cast<unsigned>(std::min<std::size_t>(entries.size(),std::clamp(std::thread::hardware_concurrency(),1u,4u)));
+    const auto readStarted=Clock::now();
+    const auto parse=[&] {
+        for(auto i=next.fetch_add(1);i<entries.size();i=next.fetch_add(1)) {
+            const auto started=Clock::now();
+            try {
+                const auto& p=entries.at(i);
+                auto utf8=p.at("path").get<std::string>();
+                auto path=std::filesystem::path(std::u8string(utf8.begin(),utf8.end()));
+                plugins[i]=readPlugin(path,p.at("name").get<std::string>(),&hashTimes[i]);
+                if(observer) {const auto observed=Clock::now();observer(plugins[i]);observerTimes[i]=std::chrono::duration<double,std::milli>(Clock::now()-observed).count();}
+            } catch(...) {failures[i]=std::current_exception();}
+            readTimes[i]=std::chrono::duration<double,std::milli>(Clock::now()-started).count()-hashTimes[i]-observerTimes[i];
+        }
+    };
+    {
+        // Workers touch only independent disk inputs. Slots retain load order;
+        // no game objects, shared plan mutation, or engine calls run here.
+        std::vector<std::jthread> threads;
+        for(unsigned i=1;i<workers;++i) threads.emplace_back(parse);
+        parse();
     }
-    return makePlan(plugins,config,exclusions);
+    for(std::size_t i=0;i<failures.size();++i) if(failures[i]) {
+        try {std::rethrow_exception(failures[i]);}
+        catch(const std::exception& e) {throw std::runtime_error(entries.at(i).at("name").get<std::string>()+": "+e.what());}
+    }
+    const auto planStarted=Clock::now();
+    if(timings) {
+        timings->pluginReadWallMilliseconds=std::chrono::duration<double,std::milli>(planStarted-readStarted).count();timings->parseWorkers=workers;
+        for(std::size_t i=0;i<entries.size();++i) {timings->readParseMilliseconds+=readTimes[i];timings->hashMilliseconds+=hashTimes[i];timings->observerMilliseconds+=observerTimes[i];}
+    }
+    auto result=makePlan(std::move(plugins),config,exclusions);
+    if(timings) timings->planMilliseconds=std::chrono::duration<double,std::milli>(Clock::now()-planStarted).count();
+    return result;
 }
 }

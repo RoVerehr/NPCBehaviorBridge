@@ -2,8 +2,10 @@
 #include <nlohmann/json.hpp>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <set>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -35,10 +37,20 @@ std::string formKey(std::uint32_t raw, const Sequence& mastersAndSelf);
 std::string hashFile(const std::filesystem::path& path);
 Json readJson(const std::filesystem::path& path);
 void writeJson(const std::filesystem::path& path, const Json& data);
-Plugin readPlugin(const std::filesystem::path& path, std::string name);
+// Decode an already decompressed NPC record; performs no file or engine access.
+Npc parseNpcRecord(std::span<const std::uint8_t> data, const std::string& key, const std::string& pluginName,
+    const Sequence& mastersAndSelf, std::uint32_t flags);
+Plugin readPlugin(const std::filesystem::path& path, std::string name, double* hashMilliseconds = nullptr);
 Sequence parseExclusions(std::string text);
 Sequence readExclusions(const std::filesystem::path& path);
-Json makePlan(const std::vector<Plugin>& plugins, const Json& config, const Sequence& exclusions = {});
-Json run(const Json& manifest, const Json& config, const Sequence& exclusions = {});
+Json makePlan(std::vector<Plugin> plugins, const Json& config, const Sequence& exclusions = {});
+struct RunTimings {
+    double readParseMilliseconds{}, hashMilliseconds{}, planMilliseconds{};
+    double pluginReadWallMilliseconds{};
+    unsigned parseWorkers{};
+    double observerMilliseconds{};
+};
+Json run(const Json& manifest, const Json& config, const Sequence& exclusions = {}, RunTimings* timings = nullptr,
+    const std::function<void(const Plugin&)>& observer = {});
 void validateConfig(const Json& config);
 }

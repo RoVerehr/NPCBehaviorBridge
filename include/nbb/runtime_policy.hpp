@@ -32,4 +32,18 @@ constexpr unsigned addressFormat(const Version& v) { return v.minor == 5 ? 1 : v
 constexpr std::uint32_t pack(const Version& v) {
     return (std::uint32_t(v.major) << 24) | (std::uint32_t(v.minor) << 16) | (std::uint32_t(v.build) << 4) | v.store;
 }
+// Flat Skyrim TESNPC/TESFile ABI used by the two chained capture callbacks.
+// The pinned CommonLib headers keep these layouts and vtable slots identical
+// for all supported SE/AE builds. Selection still checks each known runtime and
+// its SKSE store marker; PE revision zero must not be confused with GOG store 1.
+struct CaptureLayout {
+    std::uint32_t npcBytes, fileBytes;
+    std::uint32_t loadSlot, initSlot;
+    std::uint64_t seVtableID, aeVtableID;
+};
+inline constexpr CaptureLayout flatCapture{0x268,0x4C8,0x06,0x13,241857,195816};
+constexpr const CaptureLayout* captureLayout(const Version& v) {
+    return selectSKSE(v.major,v.minor,v.build,v.store)?&flatCapture:nullptr;
+}
+
 }

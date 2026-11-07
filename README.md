@@ -1,4 +1,4 @@
-# NPC Behavior Bridge 0.6.8
+# NPC Behavior Bridge 0.7
 
 NPC Behavior Bridge is an SKSE plugin that restores selected NPC base-record gameplay changes when later plugins revert them to baseline values.
 
@@ -10,9 +10,9 @@ It follows three steps:
 
 It does not invent schedules or combat behavior. AI Overhaul and USSEP are optional; no mod-name whitelist is used. Lists are selected whole rather than merged entry by entry. The default configuration uses USSEP as an additional baseline, falling back when unavailable.
 
-The plugin handles enabled gameplay fields, template inheritance, related stat calculation and supported script attachments. It protects appearance, race, voice and outfits; restoring a gameplay template may change an inherited name. Base fields are processed once after game data loads. Subsequent save/load, waiting and location checks do not repeatedly force the values back.
+The plugin handles enabled gameplay fields, template inheritance, related stat calculation and supported script attachments. It protects appearance, race, voice and outfits; restoring a gameplay template may change an inherited name. NPC input is captured from the game's existing loading buffers. One complete plan is shared by early initialization and the remaining DataLoaded recovery; the successful path does not scan plugin files a second time. Subsequent save/load, waiting and location checks do not repeatedly force the values back.
 
-This repository contains the source corresponding to **0.6.8**, build instructions, pinned dependency submodules and license notices. Local test fixtures, game data, sampling reports, deployment paths, runtime configuration and binary packages are not included. Use the configuration files supplied with the matching mod release.
+This repository contains the source corresponding to **0.7**, build instructions, pinned dependency submodules and license notices. Local test fixtures, game data, sampling reports, deployment paths, runtime configuration and binary packages are not included. Use the configuration files supplied with the matching mod release.
 
 The player is always excluded. Set `"debug": true` in the release configuration to generate detailed diagnostics and `NPCBehaviorBridge-report.html`, a searchable startup snapshot in the SKSE log directory. Debug mode is off by default; normal logging retains per-NPC outcomes and errors. Each game launch replaces the log and clears old diagnostic reports.
 
@@ -38,7 +38,7 @@ If using a downloaded source ZIP, run `python tools/prepare_dependencies.py` fir
 - Steam: 1.5.97; 1.6.317, 1.6.318, 1.6.323, 1.6.342, 1.6.353, 1.6.629, 1.6.640, 1.6.1130, 1.6.1170; 1.7.99 and 1.7.104.
 - GOG: 1.6.659 and 1.6.1179.
 
-Requires matching SKSE and Address Library installations and the Microsoft Visual C++ x64 runtime. VR and unlisted versions are unsupported. The 14-version address/layout and loader checks are offline validation; in-game sampling was performed on Steam 1.6.1170.
+Requires matching SKSE and Address Library installations and the Microsoft Visual C++ x64 runtime. VR and unlisted versions are unsupported. The capture path is enabled for every listed runtime, including both GOG versions. GOG's SKSE store marker is handled separately from the executable revision. An incomplete capture, unsupported loading lifecycle, changed configuration, or failed coverage check uses the original disk-based recovery path. The 14-version capture address/layout/dispatch and loader checks are offline validation; in-game validation is limited to Steam 1.6.1170.
 
 Destructible data is tracked but not written. Unresolved leveled-template branches and invalid references are skipped. Existing script-instance preservation has been observed in game. In 0.6.7, Lydia's missing WIDeadBodyCleanupScript was created and bound successfully, its properties were verified, and the single instance persisted after saving, fully restarting the game and loading that save on Steam 1.6.1170. This does not establish support for arbitrary scripts, custom OnInit handlers or array properties; execution of the death-cleanup event was not tested.
 

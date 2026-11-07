@@ -1,6 +1,7 @@
 #pragma once
 #include "nbb/core.hpp"
 #include <string_view>
+#include <unordered_map>
 
 namespace nbb {
 // Scalar definitions describe disk serialization and the supported TESNPC layout.
@@ -37,8 +38,8 @@ inline const std::vector<ScalarField> scalarFields=[] {
     return v;
 }();
 inline const ScalarField* scalarField(std::string_view name) {
-    for(const auto& f:scalarFields) if(name==f.name) return &f;
-    return nullptr;
+    static const auto index=[] {std::unordered_map<std::string_view,const ScalarField*> result;for(const auto& f:scalarFields)result.emplace(f.name,&f);return result;}();
+    auto found=index.find(name);return found==index.end()?nullptr:found->second;
 }
 inline Json decodeScalarWord(const ScalarField& field,std::uint32_t raw) {
     if(field.runtimeMask) raw=(raw&field.runtimeMask)>>field.shift;
