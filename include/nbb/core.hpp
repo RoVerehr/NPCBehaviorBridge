@@ -22,6 +22,8 @@ struct Npc {
     Json fields, observed;
     std::uint16_t templateFlags{};
     bool deleted{}, ignored{};
+    // Unreadable input is isolated per field, never replaced by a guessed value.
+    Json inputErrors = Json::object();
 };
 struct Plugin {
     std::string name;

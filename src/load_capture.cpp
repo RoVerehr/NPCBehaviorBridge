@@ -14,7 +14,6 @@
 #include <charconv>
 namespace nbb::load_capture {
 namespace {
-constexpr std::size_t packageLimit=64,factionLimit=128;
 constexpr std::array<const char*,10> refNames{"Template","Class","CombatStyle","DeathItem","Race","SPOR","DPLT","ECOR","OCOR","GWOR"};
 constexpr std::array<std::size_t,10> refOffsets{0x60,0x1C0,0x1D8,0x50,0x158,0x168,0x228,0x180,0x170,0x178};
 struct FileContext {
@@ -28,9 +27,9 @@ static_assert(sizeof(RE::FACTION_RANK)==16&&sizeof(RE::BSTArray<RE::FACTION_RANK
 struct Snapshot {
     bool readable{};std::array<std::uint8_t,0x268> bytes{};
     std::array<Ref,refNames.size()> refs{};
-    std::array<Ref,packageLimit> packages{};
+    std::vector<Ref> packages;
     std::uint32_t packageCount{};bool packageReadFailed{},packageTruncated{};
-    std::array<Faction,factionLimit> factions{};std::uint32_t factionCount{};
+    std::vector<Faction> factions;std::uint32_t factionCount{};
     bool factionReadFailed{},factionTruncated{};
 };
 
@@ -121,7 +120,7 @@ RE::TESFile* lastFile(RE::TESNPC* npc) noexcept {
     // Guarded equivalent of TESForm::GetFile(-1); no engine getter or file seek.
     std::uintptr_t array{},data{};std::uint32_t size{};RE::TESFile* file{};
     if(!read(reinterpret_cast<std::uintptr_t>(npc)+0x08,&array,8)||!array||!read(array,&data,8)||
-       !read(array+8,&size,4)||!size||size>4096)return nullptr;
+       !read(array+8,&size,4)||!size)return nullptr;
     read(data+sizeof(void*)*(size-1),&file,sizeof(file));return file;
 }
 Ref reference(std::uint64_t raw) noexcept {
@@ -134,24 +133,25 @@ Ref reference(std::uint64_t raw) noexcept {
     }
     return r;
 }
-Snapshot capture(RE::TESNPC* npc) noexcept {
+Snapshot capture(RE::TESNPC* npc) {
     Snapshot s;s.readable=read(reinterpret_cast<std::uintptr_t>(npc),s.bytes.data(),s.bytes.size());
     if(!s.readable)return s;
     for(std::size_t i=0;i<refOffsets.size();++i)s.refs[i]=reference(value<std::uint64_t>(s,refOffsets[i]));
     const auto factionData=value<std::uint64_t>(s,0x70);const auto factionSize=value<std::uint32_t>(s,0x80);
-    s.factionTruncated=factionSize>factionLimit;
-    for(unsigned i=0;i<std::min<std::size_t>(factionSize,factionLimit);++i){
+    s.factionTruncated=factionSize>value<std::uint32_t>(s,0x78);
+    for(unsigned i=0;!s.factionTruncated&&i<factionSize;++i){
         std::array<std::uint8_t,16> bytes{};
         if(!factionData||!read(factionData+i*16,bytes.data(),bytes.size())){s.factionReadFailed=true;break;}
-        std::uint64_t raw{};std::memcpy(&raw,bytes.data(),8);auto& f=s.factions[s.factionCount++];f.ref=reference(raw);std::memcpy(&f.rank,bytes.data()+8,1);
+        std::uint64_t raw{};std::memcpy(&raw,bytes.data(),8);s.factions.emplace_back();auto& f=s.factions.back();++s.factionCount;f.ref=reference(raw);std::memcpy(&f.rank,bytes.data()+8,1);
     }
     // Embedded BSSimpleList head. Bound traversal and use guarded reads because
     // these are intermediate loader states, not initialized runtime records.
     auto item=value<std::uint64_t>(s,0xC8),next=value<std::uint64_t>(s,0xD0);
-    for(std::size_t n=0;n<packageLimit;++n) {
-        if(item)s.packages[s.packageCount++]=reference(item);
+    std::unordered_set<std::uintptr_t> seenNodes;
+    for(;;) {
+        if(item){s.packages.push_back(reference(item));++s.packageCount;}
         if(!next)return s;
-        if(n+1==packageLimit){s.packageTruncated=true;return s;}
+        if(!seenNodes.insert(next).second){s.packageTruncated=true;return s;}
         std::array<std::uint64_t,2> node{};
         if(!read(next,node.data(),sizeof(node))){s.packageReadFailed=true;return s;}
         item=node[0];next=node[1];
@@ -202,7 +202,7 @@ std::map<std::string,StreamFile> streamFiles;
 std::mutex streamMutex;
 std::unique_ptr<EarlyEnvironment> streamEnvironment;
 bool streamReady=false,streamReused=false;
-std::string streamBuildError;
+std::string streamBuildError,streamFallbackReason;
 std::size_t streamParsedRecords{},streamInputNpcs{};
 Json streamEvidence=Json::array();
 Sequence streamPluginOrder;
@@ -232,25 +232,34 @@ void collectStream(RE::TESNPC* npc,RE::TESFile* file,bool success,load_stream::P
     try {
         // A compressed buffer can be created lazily by native Load. Retry only
         // observation after it returns; never request decompression ourselves.
-        if(!payload.complete && streamBytes.load()<streamByteLimit && streamCalls.load()<=streamRecordLimit)payload=load_stream::capture(reinterpret_cast<std::uintptr_t>(file),read);
+        if(!payload.complete && streamBytes.load()<streamByteLimit && streamCalls.load()<=streamRecordLimit) {
+            auto first=payload.error;payload=load_stream::capture(reinterpret_cast<std::uintptr_t>(file),read);
+            if(!payload.complete)payload.error="before native Load: "+first+"; after native Load: "+payload.error;
+        }
         RE::FORM current{};need(read(reinterpret_cast<std::uintptr_t>(file)+offsetof(RE::TESFile,currentform),&current,sizeof(current)),"Full capture header unreadable");
         auto ctx=context(file);need(ctx.valid,"Full capture context unavailable");
         const auto name=lower(std::string(ctx.name.data()));
         std::lock_guard lock(streamMutex);
         streamThreads.insert(GetCurrentThreadId());
-        auto issue=[&](const std::string& error){++streamFailures;if(streamIssues.size()<100)streamIssues.push_back({{"plugin",name},{"form_id",current.formID},{"reason",error}});};
+        auto issue=[&](const std::string& error){++streamFailures;streamIssues.push_back({{"plugin",name},{"form_id",current.formID},{"reason",error}});};
         if(streamFrozen.load()){++streamLateLoads;issue("Load completed after full capture freeze");return;}
-        if(!payload.complete){issue(payload.error.empty()?"Full capture incomplete":payload.error);return;}
+        if(!payload.complete){issue(payload.error.empty()?"Full capture incomplete":payload.error);
+            streamIssues.back()["payload_form_id"]=payload.id;streamIssues.back()["record_flags"]=payload.flags;
+            streamIssues.back()["record_size"]=payload.recordSize;streamIssues.back()["file_offset"]=payload.fileOffset;return;}
         if(payload.id!=current.formID || payload.flags!=current.flags || payload.recordSize!=current.length ||
             (!success && !(payload.flags&(0x20|0x1000))) || (success && (!npc||npc->formID!=payload.id))) {
-            issue("Full capture identity or native Load result mismatch");return;
+            issue("Full capture identity or native Load result mismatch");
+            streamIssues.back()["captured_form_id"]=payload.id;streamIssues.back()["native_form_id"]=npc?npc->formID:0;
+            streamIssues.back()["native_load_succeeded"]=success;streamIssues.back()["header_flags"]=current.flags;
+            streamIssues.back()["captured_flags"]=payload.flags;streamIssues.back()["header_size"]=current.length;
+            streamIssues.back()["captured_size"]=payload.recordSize;return;
         }
         if(streamCalls.load()>streamRecordLimit || payload.bytes.size()>streamByteLimit-streamBytes.load()) {issue("Full capture memory/record limit");return;}
         auto& dest=streamFiles[name];if(dest.records.empty())dest.context=ctx;
-        if(dest.records.contains(payload.id)){++streamDuplicates;issue("Duplicate full NPC record in plugin");return;}
+        if(dest.records.contains(payload.id))++streamDuplicates; // Retain the latest observed definition.
         streamBytes.fetch_add(payload.bytes.size());++streamSources[payload.source];
-        dest.records.emplace(payload.id,StreamRecord{std::move(payload),{},success});
-    }catch(const std::exception& e){std::lock_guard lock(streamMutex);++streamFailures;if(streamIssues.size()<100)streamIssues.push_back({{"reason",e.what()}});}
+        dest.records.insert_or_assign(payload.id,StreamRecord{std::move(payload),{},success});
+    }catch(const std::exception& e){std::lock_guard lock(streamMutex);++streamFailures;streamIssues.push_back({{"reason",e.what()}});}
      catch(...){std::lock_guard lock(streamMutex);++streamFailures;}
 }
 void prepareStreamInput(EarlyEnvironment seed) {
@@ -270,7 +279,7 @@ void prepareStreamInput(EarlyEnvironment seed) {
         file.names.push_back(name);
         for(auto& [id,record]:file.records)record.key=env.key(id).get<std::string>();
     }
-    need(streamFailures==0 && streamDuplicates==0,"Incomplete full record history");
+    need(streamFailures==0,("Incomplete full record history: "+std::to_string(streamFailures)+" failed captures; detailed causes follow in the log").c_str());
 }
 std::string fullRuntimeType(std::uint32_t id) {
     auto* form=lookup(id);return !form||form->formID!=id?"INVALID":form->IsDeleted()?"DELETED":std::string(RE::FormTypeToString(form->GetFormType()));
@@ -305,7 +314,7 @@ Json createStreamPlan(EarlyEnvironment& env,const std::function<std::string(std:
             for(const auto& [id,record]:input.records) {
                 need(record.payload.complete,"Incomplete captured record");
                 auto npc=parseNpcRecord(record.payload.bytes,record.key,plugin.name,input.names,record.payload.flags);
-                need(plugin.npcs.emplace(record.key,std::move(npc)).second,"Duplicate captured NPC");++counts[i];
+                plugin.npcs.insert_or_assign(record.key,std::move(npc));++counts[i];
             }
         }catch(...){failures[i]=std::current_exception();}
     };
@@ -324,8 +333,8 @@ Json createStreamPlan(EarlyEnvironment& env,const std::function<std::string(std:
     return result;
 }
 void validateParent(RE::TESNPC* child,RE::TESForm* parent) {
-    std::set<std::uint32_t> seen{child->formID};unsigned depth=0;
-    while(parent){need(++depth<=128,"Early template chain too deep");need(parent->GetFormType()==RE::FormType::NPC&&!parent->IsDeleted(),"Early template must be a nondeleted NPC");
+    std::set<std::uint32_t> seen{child->formID};
+    while(parent){need(parent->GetFormType()==RE::FormType::NPC&&!parent->IsDeleted(),"Early template must be a nondeleted NPC");
         need(seen.insert(parent->formID).second,"Early template cycle");auto* p=static_cast<RE::TESNPC*>(parent);const auto s=capture(p);need(s.readable,"Early parent unreadable");const auto& r=s.refs[0];
         if(!r.raw)break;
         if(r.readable){parent=lookup(r.observedID);need(reinterpret_cast<std::uintptr_t>(parent)==r.raw,"Early template pointer mismatch");}
@@ -334,7 +343,9 @@ void validateParent(RE::TESNPC* child,RE::TESForm* parent) {
 }
 void earlyApplyImpl(RE::TESNPC* npc,EarlyEnvironment& env,const Json& input) {
     const auto key=env.key(npc->formID).get<std::string>();Json result={{"npc",key},{"status","skipped"}};
-    auto store=[&](const char* reason){result["reason"]=reason;earlyResults.push_back(result);if(captureConfig.value("debug",false))SKSE::log::info("Early recovery {}: {}",key,reason);};
+    auto store=[&](const char* reason){result["reason"]=reason;earlyResults.push_back(result);
+        if(result.contains("deferred_template_reason"))SKSE::log::error("Early recovery deferred: npc={}; field=Template; reason={}; regular field recovery retained",key,result["deferred_template_reason"].get<std::string>());
+        if(captureConfig.value("debug",false))SKSE::log::info("Early recovery {}: {}",key,reason);};
     if(key=="skyrim.esm:000007"){store("Player excluded");return;}
     if(captureConfig.value("mode",std::string())!="apply"){store("Audit mode; no early writes");return;}
     if(!captureConfig.at("only_npcs").empty()){bool allowed=false;for(const auto& k:captureConfig.at("only_npcs"))allowed|=parseExclusions(k.get<std::string>()).at(0)==key;if(!allowed){store("Outside requested NPC scope");return;}}
@@ -363,7 +374,7 @@ void earlyApplyImpl(RE::TESNPC* npc,EarlyEnvironment& env,const Json& input) {
     auto runtimeRef=[&](const Ref& r)->Json {if(!r.raw)return nullptr;need(r.readable,"Field has not been resolved by InitItem");auto* f=lookup(r.observedID);need(reinterpret_cast<std::uintptr_t>(f)==r.raw&&!f->IsDeleted(),"Untrusted early runtime reference");return env.key(r.observedID);};
     auto fieldValue=[&](const Snapshot& s,const std::string& f)->Json {
         if(f=="PKID"){need(!s.packageReadFailed&&!s.packageTruncated,"Runtime package snapshot incomplete");Json a=Json::array();for(unsigned i=0;i<s.packageCount;++i)a.push_back(runtimeRef(s.packages[i]));return a;}
-        if(f=="Factions"){need(!s.factionReadFailed&&!s.factionTruncated,"Runtime faction snapshot incomplete");Json a=Json::array();for(unsigned i=0;i<s.factionCount;++i){auto key=runtimeRef(s.factions[i].ref);need(!key.is_null(),"Null runtime faction");a.push_back(Json::array({key,int(s.factions[i].rank)}));}std::sort(a.begin(),a.end());return a;}
+        if(f=="Factions"){need(!s.factionReadFailed&&!s.factionTruncated,"Runtime faction snapshot incomplete");Json a=Json::array();for(unsigned i=0;i<s.factionCount;++i){auto key=runtimeRef(s.factions[i].ref);need(!key.is_null(),"Null runtime faction");a.push_back(Json::array({key,int(s.factions[i].rank)}));}return a;}
         if(auto ri=referenceIndex(f);ri>=0)return runtimeRef(s.refs[ri]);
         const auto* sf=earlyScalar(f);need(sf,"Unknown early scalar read");return scalar(s,*sf);
     };
@@ -384,11 +395,13 @@ void earlyApplyImpl(RE::TESNPC* npc,EarlyEnvironment& env,const Json& input) {
         auto resolve=[&](const Json& v,RE::FormType t){if(v.is_null())return static_cast<RE::TESForm*>(nullptr);auto* p=lookup(env.ids.at(v.get<std::string>()));need(p&&p->GetFormType()==t&&!p->IsDeleted()&&env.key(p->formID)==v,"Early target reference failed validation");return p;};
         if(actual[f]==desired[f])continue;
         if(f=="PKID"){for(auto it=desired[f].rbegin();it!=desired[f].rend();++it){auto* p=resolve(*it,RE::FormType::Package);need(p,"Null early package");replacement.push_front(static_cast<RE::TESPackage*>(p));}packagesChanged=true;allow(0xC8,16);}
-        else if(f=="Factions"){need(desired[f].size()<=factionLimit,"Too many early factions");newFactions.reserve(static_cast<std::uint32_t>(desired[f].size()));for(const auto& e:desired[f]){auto* p=resolve(e.at(0),RE::FormType::Faction);need(p,"Null early faction");newFactions.push_back(RE::FACTION_RANK{static_cast<RE::TESFaction*>(p),e.at(1).get<std::int8_t>()});}factionsChanged=true;allow(0x70,sizeof(RE::BSTArray<RE::FACTION_RANK>));}
+        else if(f=="Factions"){need(desired[f].size()<=UINT32_MAX,"Faction list exceeds native 32-bit storage");newFactions.reserve(static_cast<std::uint32_t>(desired[f].size()));for(const auto& e:desired[f]){auto* p=resolve(e.at(0),RE::FormType::Faction);need(p,"Null early faction");newFactions.push_back(RE::FACTION_RANK{static_cast<RE::TESFaction*>(p),e.at(1).get<std::int8_t>()});}factionsChanged=true;allow(0x70,sizeof(RE::BSTArray<RE::FACTION_RANK>));}
         else if(auto ri=referenceIndex(f);ri>=0){
             pointers[f]=resolve(desired[f],f=="Template"?RE::FormType::NPC:f=="CombatStyle"?RE::FormType::CombatStyle:RE::FormType::FormList);
             if(f=="Template"){validateParent(npc,pointers[f]);}allow(refOffsets[ri],8);
         } else {const auto* sf=earlyScalar(f);need(sf,"Unknown early scalar write");
+            const auto maximum=sf->runtimeMask?(sf->runtimeMask>>sf->shift):sf->runtimeBytes==4?UINT32_MAX:((1u<<(8*sf->runtimeBytes))-1);
+            if(!sf->boolean&&!sf->signedValue)need(desired[f].get<std::uint64_t>()<=maximum,"Value exceeds native field storage");
             std::uint32_t word{};std::memcpy(&word,encoded.data()+sf->runtimeOffset,sf->runtimeBytes);word=encodeScalarWord(*sf,word,desired[f]);std::memcpy(encoded.data()+sf->runtimeOffset,&word,sf->runtimeBytes);
             wordWrites[sf->runtimeOffset]=sf->runtimeBytes;
             for(unsigned b=0;b<sf->runtimeBytes;++b)allowedBits[sf->runtimeOffset+b]|=sf->runtimeMask?static_cast<std::uint8_t>(sf->runtimeMask>>(8*b)):0xFF;
@@ -410,7 +423,7 @@ void earlyApplyImpl(RE::TESNPC* npc,EarlyEnvironment& env,const Json& input) {
         if(factionsChanged)npc->factions=std::move(oldFactions);
         for(const auto& [f,p]:pointers){auto ri=referenceIndex(f);std::memcpy(reinterpret_cast<std::uint8_t*>(npc)+refOffsets[ri],&before.refs[ri].raw,8);}
         for(const auto& [offset,bytes]:wordWrites)std::memcpy(reinterpret_cast<std::uint8_t*>(npc)+offset,before.bytes.data()+offset,bytes);
-        throw std::runtime_error("Early readback/protection failed; transaction fields rolled back");
+        throw; // Preserve the exact failed field/readback/protection cause.
     }
     unsigned changed=0;for(auto& [f,v]:desired.items())changed+=actual.at(f)!=v;
     result["status"]=changed?"applied_verified":"already_matches";result["changed_fields"]=changed;result["protected_bytes_equal"]=true;result["phase"]="after_native_init_before_template_copy";
@@ -460,21 +473,28 @@ void applyAll(RE::TESNPC* npc) noexcept {
         auto row=earlyProjection(globalPlan["npcs"][globalRows.at(npc->formID)]);
         if(row.is_null())return;
         const auto began=Clock::now();
-        try{earlyApplyImpl(npc,*globalEnvironment,row);}
-        catch(const std::exception& e){earlyResults.push_back({{"npc",row.at("npc")},{"status","error"},{"reason",e.what()}});SKSE::log::error("Early recovery {}: {}; regular recovery retained",row.at("npc").get<std::string>(),e.what());}
+        for(const auto& [field,spec]:row.at("fields").items())if(spec.at("status")=="ready") {
+            Json isolated={{"npc",row.at("npc")},{"winner",row.at("winner")},{"status","ready"},{"fields",{{field,spec}}}};
+            const auto first=earlyResults.size();
+            try {earlyApplyImpl(npc,*globalEnvironment,isolated);}
+            catch(const std::exception& e){earlyResults.push_back({{"npc",row.at("npc")},{"field",field},{"status","error"},{"reason",e.what()}});
+                SKSE::log::error("Early recovery: plugin={}; npc={}; field={}; reason={}; other fields continue",row.at("winner").get<std::string>(),row.at("npc").get<std::string>(),field,e.what());}
+            for(auto i=first;i<earlyResults.size();++i)earlyResults[i]["field"]=field;
+        }
         applyNs+=static_cast<std::uint64_t>((Clock::now()-began).count());
     }catch(const std::exception& e){allDisabled.store(true);SKSE::log::error("Early recovery disabled: {}; regular recovery retained",e.what());}
      catch(...){allDisabled.store(true);SKSE::log::error("Early recovery disabled after unknown exception; regular recovery retained");}
 }
 std::string streamReuseFailure(const Json& manifest,const Json& config,const Sequence& exclusions,const std::vector<std::uint32_t>& actualNPCs) {
     if(!streamReady||globalPlan.is_null())return streamBuildError.empty()?"Full captured plan unavailable":streamBuildError;
-    if(!streamFrozen.load()||streamInFlight.load())return "Record capture not frozen or Load still in flight";
-    if(streamFailures||streamDuplicates)return "Incomplete or duplicate captured record history";
-    if(allDisabled.load()||streamLateLoads.load()||foreignInitThreads.load())return "Unsupported early loading lifecycle";
-    if(config!=captureConfig||exclusions!=captureExclusions)return "Configuration or exclusions changed during loading";
+    if(!streamFrozen.load()||streamInFlight.load())return "Record capture not frozen or Load still in flight: frozen="+std::to_string(streamFrozen.load())+"; in_flight="+std::to_string(streamInFlight.load());
+    if(streamFailures)return "Incomplete captured record history: failures="+std::to_string(streamFailures);
+    if(allDisabled.load()||streamLateLoads.load()||foreignInitThreads.load())return "Unsupported early loading lifecycle: disabled="+std::to_string(allDisabled.load())+"; late_loads="+std::to_string(streamLateLoads.load())+"; foreign_init_threads="+std::to_string(foreignInitThreads.load());
+    if(config!=captureConfig)return "Configuration changed during loading: "+Json::diff(captureConfig,config).dump();
+    if(exclusions!=captureExclusions)return "Exclusions changed during loading: captured="+Json(captureExclusions).dump()+"; current="+Json(exclusions).dump();
     Sequence order;for(const auto& p:manifest.at("plugins"))order.push_back(lower(p.at("name").get<std::string>()));
-    if(order!=streamPluginOrder)return "Loaded plugin order changed during loading";
-    for(auto id:actualNPCs)if(id&&(id>>24)!=0xFF&&!globalRows.contains(id))return "Static NPC absent from captured plan";
+    if(order!=streamPluginOrder)return "Loaded plugin order changed during loading: "+Json::diff(Json(streamPluginOrder),Json(order)).dump();
+    for(auto id:actualNPCs)if(id&&(id>>24)!=0xFF&&!globalRows.contains(id))return "Static NPC absent from captured plan: runtime_form_id="+std::to_string(id);
     return {};
 }
 bool executable(std::uintptr_t address) {
@@ -491,11 +511,17 @@ std::optional<Json> takePlan(const Json& manifest,const Json& config,const Seque
         for(auto* npc:data->GetFormArray<RE::TESNPC>())if(npc)current.push_back(npc->formID);
         failure=streamReuseFailure(manifest,config,exclusions,current);
     }catch(const std::exception& e){failure=e.what();}
-    if(!failure.empty()){SKSE::log::error("Load-stream disk fallback: {}",failure);return std::nullopt;}
+    if(!failure.empty()){streamFallbackReason=failure;SKSE::log::error("Load-stream disk fallback: {}",failure);return std::nullopt;}
     globalPlan["load_capture"]={{"records",streamParsedRecords},{"npcs",streamInputNpcs},{"plan_builds",globalPlanBuilds},{"capture_failures",streamFailures},{"sources",streamSources}};
     if(config.value("debug",false))globalPlan["load_capture"]["early_results"]=earlyResults;
     streamReused=true;SKSE::log::info("Load-stream plan reused: {} records / {} NPCs; no disk plugin scan, no repeated selection",streamParsedRecords,streamInputNpcs);
     return std::move(globalPlan);
+}
+Json diagnosticSummary() {
+    std::lock_guard lock(streamMutex);
+    return {{"records",streamParsedRecords},{"npcs",streamInputNpcs},{"plan_builds",globalPlanBuilds},
+        {"capture_failures",streamFailures},{"repeated_definitions",streamDuplicates},{"late_loads",streamLateLoads.load()},
+        {"sources",streamSources},{"fallback_reason",streamFallbackReason},{"issues",streamIssues}};
 }
 bool canPruneNativeWork(){return nativePruningAllowed;}
 double measuredEarlyMilliseconds(){return (loadOwnNs.load()+initOwnNs.load()+finishNs)/1e6;}
@@ -523,10 +549,14 @@ bool install(const runtime::Version& host) {
 void finish() {
     const auto began=Clock::now();
     if(!active.exchange(false))return;
-    unsigned fields=0,npcs=0,errors=0,skips=0;
-    for(const auto& r:earlyResults){fields+=r.value("changed_fields",0u);npcs+=r.value("changed_fields",0u)!=0;errors+=r.value("status",std::string())=="error";skips+=r.value("status",std::string())=="skipped";}
-    SKSE::log::info("Early recovery: {} fields on {} NPCs; {} deferred transactions; {} errors",fields,npcs,skips,errors);
+    unsigned fields=0,errors=0,skips=0;std::set<std::string> changedNPCs;
+    for(const auto& r:earlyResults){fields+=r.value("changed_fields",0u);if(r.value("changed_fields",0u))changedNPCs.insert(r.at("npc").get<std::string>());errors+=r.value("status",std::string())=="error";skips+=r.value("status",std::string())=="skipped";}
+    SKSE::log::info("Early recovery: {} fields on {} NPCs; {} deferred transactions; {} errors",fields,changedNPCs.size(),skips,errors);
     SKSE::log::info("Load capture: {} records, {} failures, {} late loads; plan builds={}",streamCalls.load(),streamFailures,streamLateLoads.load(),globalPlanBuilds);
+    {std::lock_guard lock(streamMutex);
+        for(const auto& issue:streamIssues)SKSE::log::error("Load capture failure: {}",issue.dump());
+    }
+    if(streamDuplicates)SKSE::log::info("Load capture repeated definitions: {}; latest observations retained",streamDuplicates);
     finishNs=static_cast<std::uint64_t>((Clock::now()-began).count());
 }
 }

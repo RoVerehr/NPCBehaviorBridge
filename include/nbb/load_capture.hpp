@@ -6,6 +6,7 @@ namespace nbb::load_capture {
 bool install(const runtime::Version& host);
 void finish();
 std::optional<Json> takePlan(const Json& manifest,const Json& config,const Sequence& exclusions);
+Json diagnosticSummary();
 void releasePlan();
 bool canPruneNativeWork();
 double measuredEarlyMilliseconds();

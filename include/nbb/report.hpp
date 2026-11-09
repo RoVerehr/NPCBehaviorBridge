@@ -23,6 +23,7 @@ inline Json model(const Json& plan) {
                 const auto& values=field.at("values");
                 field["status"]=values.contains("runtime_before")&&values.contains("runtime_after")&&values.at("runtime_before")!=values.at("runtime_after")?"restored":"unchanged";
             }
+            if(spec.contains("input_errors"))field["input_errors"]=spec.at("input_errors");
             if(spec.contains("inheritance_provider")) {
                 field["selection"]="Template inheritance or automatic-stat synchronization";
                 field["provider"]=spec.at("inheritance_provider");
@@ -43,7 +44,7 @@ inline Json model(const Json& plan) {
     return {{"mode",plan.value("mode",std::string("unknown"))},{"baseline",plan.value("baseline",Json::object())},
         {"session",plan.value("runtime_session",Json::object())},
         {"totals",{{"npcs",records.size()},{"restored_npcs",changedNPCs},{"restored_fields",restored},{"error_npcs",errorNPCs}}},
-        {"warnings",plan.value("configuration_warnings",Json::array())},{"records",records}};
+        {"load_capture",plan.value("load_capture",Json::object())},{"warnings",plan.value("configuration_warnings",Json::array())},{"records",records}};
 }
 
 inline std::string embeddedJson(const Json& value) {
@@ -86,6 +87,8 @@ function badge(status){const b=el('span',statusLabel(status),'badge');b.classLis
 $('session').textContent=`Mode: ${data.mode} · Runtime: ${data.session.runtime||'not recorded'} ${data.session.store||''} · Baseline: ${data.baseline.active||'official / first definition'}${data.session.pid?' · Process '+data.session.pid:''}`;
 for(const [key,label] of [['npcs','NPCs reviewed'],['restored_npcs','NPCs restored'],['restored_fields','Fields changed'],['error_npcs','NPCs with errors']]){const c=el('div',undefined,'card');c.append(el('strong',Number(data.totals[key]).toLocaleString()),el('span',label));$('cards').append(c);}
 for(const w of data.warnings)$('warnings').append(el('p',JSON.stringify(w),'notice'));
+if(data.load_capture.fallback_reason)$('warnings').append(el('p','Disk input fallback: '+data.load_capture.fallback_reason,'notice'));
+for(const issue of data.load_capture.issues||[])$('warnings').append(el('p','Load capture failure: '+JSON.stringify(issue),'errorText'));
 const searchIndex=data.records.map(r=>[r.key,r.editor,r.name,r.winner,r.baseline,...r.fields.flatMap(f=>[f.name,...f.sources])].join(' ').toLowerCase());
 let page=0,filtered=[],timer;const pageSize=40;
 function matches(r,filter){if(filter==='all')return true;if(filter==='attention')return r.status==='restored'||r.status==='error'||r.status==='audit'||r.pending>0||r.skipped>0||r.reason!=='';if(filter==='pending')return r.pending>0;if(filter==='skipped')return r.status==='skipped'||r.skipped>0;return r.status===filter;}

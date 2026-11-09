@@ -1,5 +1,6 @@
 #pragma once
 #include "nbb/core.hpp"
+#include "nbb/runtime_normalization.hpp"
 #include <algorithm>
 #include <numeric>
 #include <functional>
@@ -31,7 +32,7 @@ inline std::set<std::string> inheritanceCaptureScope(const Json& rows,const Json
     for(const auto* graph:{&oldGraph,&newGraph}) for(auto& [start,_]:graph->items()) {
         std::set<std::string> seen;auto key=start;
         for(unsigned depth=0;graph->contains(key);++depth) {
-            if(depth>=128||!seen.insert(key).second){scope.insert(start);break;}
+            if(!seen.insert(key).second){scope.insert(start);break;}
             const auto& parent=graph->at(key).at("template");if(parent.is_null())break;
             key=parent.get<std::string>();
         }
@@ -80,14 +81,13 @@ inline const Sequence statInputs{"Class","Level","PCLevelMult","CalcMinLevel","C
 // Resolve chains without calling engine initialization or choosing random LVLN entries.
 inline std::string inheritedProvider(const std::string& start,unsigned bit,const Json& graph) {
     std::set<std::string> seen;auto key=start;
-    for(unsigned depth=0;depth<128;++depth) {
+    for(;;) {
         if(!graph.contains(key)) throw std::runtime_error("Unresolved or leveled NPC template: "+key);
         if(!seen.insert(key).second) throw std::runtime_error("Cyclic template chain");
         const auto& n=graph.at(key);
         if(!(n.at("flags").get<unsigned>()&bit)||n.at("template").is_null())return key;
         key=n.at("template").get<std::string>();
     }
-    throw std::runtime_error("Excessive template chain");
 }
 // Numeric edges avoid repeated FormKey/JSON lookups while walking a template chain.
 // Only relationships are indexed; runtime field values still use the original snapshots.
@@ -110,16 +110,15 @@ public:
     }
     std::string provider(const std::string& start,unsigned bit) const {
         auto found=indices.find(start);auto index=found==indices.end()?absent:found->second;
-        const std::string* key=&start;std::array<std::size_t,128> seen{};
-        for(unsigned depth=0;depth<seen.size();++depth) {
+        const std::string* key=&start;std::set<std::size_t> seen;
+        for(;;) {
             if(index==absent)throw std::runtime_error("Unresolved or leveled NPC template: "+*key);
-            if(std::find(seen.begin(),seen.begin()+depth,index)!=seen.begin()+depth)throw std::runtime_error("Cyclic template chain");
-            seen[depth]=index;const auto& node=nodes[index];
+            if(!seen.insert(index).second)throw std::runtime_error("Cyclic template chain");
+            const auto& node=nodes[index];
             if(!(node.flags&bit)||!node.hasParent)return node.key;
             index=node.parent;key=&node.parentKey;
         }
-        throw std::runtime_error("Excessive template chain");
-    }
+        }
     void clear(){nodes.clear();indices.clear();}
 };
 struct PreparedInheritanceFields {
@@ -194,17 +193,18 @@ inline bool permitsValue(const Json& actual,const Json& spec) {
     return spec.value("status",std::string())=="ready" && (actual==spec.at("disk")||actual==spec.at("expected")||
         (spec.contains("inherited_old_value")&&actual==spec.at("inherited_old_value")));
 }
-inline void addInheritedField(Json& row,const std::string& field,const Json& expected,const Json& oldValue,const std::string& provider) {
+inline void addInheritedField(Json& row,const std::string& field,const Json& expected,const Json& oldValue,const std::string& provider,const FieldEquality& same=identicalField) {
+    if(row.contains("input_errors")&&row.at("input_errors").contains(field))return;
     const auto& disk=row["inheritance_record"]["fields"];
     auto spec=row["fields"].contains(field)?row["fields"][field]:Json{{"baseline",oldValue},{"official_baseline",oldValue},{"sources",Json::array()}};
     if(!spec.contains("local_selection")) spec["local_selection"]={{"expected",spec.value("expected",disk.value(field,oldValue))},{"status",spec.value("status",std::string("no_local_candidate"))}};
-    spec["disk"]=disk.value(field,oldValue);spec["expected"]=expected;spec["differs"]=spec["disk"]!=expected;spec["status"]="ready";spec["reason"]="";
+    spec["disk"]=disk.value(field,oldValue);spec["expected"]=expected;spec["differs"]=!same(field,spec["disk"],expected);spec["status"]="ready";spec["reason"]="";
     spec["inherited_old_value"]=oldValue;spec["inheritance_provider"]=provider;
     row["fields"][field]=std::move(spec);row["status"]="ready";row["reason"]="";
 }
 inline bool needsNativeFallback(const Json& row,bool automatic,const InheritanceIndex& oldGraph,const InheritanceIndex& newGraph,
     const std::function<Json(const std::string&,const std::string&)>& read,
-    const std::function<bool(const std::string&)>& canCopyAttack) {
+    const std::function<bool(const std::string&)>& canCopyAttack,const FieldEquality& same=identicalField) {
     if(row.at("status")!="ready")return false;auto key=row.at("npc").get<std::string>();
     std::array<std::optional<std::string>,13> oldSources,newSources;
     auto provider=[&](unsigned bit,bool projected)->const std::string& {auto& cached=(projected?newSources:oldSources).at(std::countr_zero(bit));if(!cached)cached=(projected?newGraph:oldGraph).provider(key,bit);return *cached;};
@@ -219,7 +219,7 @@ inline bool needsNativeFallback(const Json& row,bool automatic,const Inheritance
                 effective=read(source,f);
             }
         }
-        if(actual!=effective)return true;
+        if(!same(f,actual,effective))return true;
     }
     return false;
 }
@@ -227,7 +227,7 @@ inline bool needsNativeFallback(const Json& row,bool automatic,const Inheritance
 // inherited candidate metadata without recalculating already-final engine stats.
 inline void settleInheritedFields(Json& row,bool automatic,const InheritanceIndex& graph,
     const std::function<Json(const std::string&,const std::string&)>& read,
-    const std::function<bool(const std::string&)>& canCopyAttack) {
+    const std::function<bool(const std::string&)>& canCopyAttack,const FieldEquality& same=identicalField) {
     if(row.at("status")!="ready")return;auto key=row.at("npc").get<std::string>();
     std::array<std::optional<std::string>,13> sources;
     std::vector<std::string> fields;for(auto& [f,_]:row["fields"].items())fields.push_back(f);
@@ -239,14 +239,14 @@ inline void settleInheritedFields(Json& row,bool automatic,const InheritanceInde
             row["inheritance_notes"][f]="Race-default attack map retained for child race";spec["status"]="skipped";spec["reason"]="Inherited attack map uses race default; child race retained";continue;
         }
         auto actual=read(key,f),parent=read(source,f);
-        if(actual!=parent)throw std::runtime_error("Settled inheritance proof changed");
-        addInheritedField(row,f,parent,parent,source);
+        if(!same(f,actual,parent))throw std::runtime_error("Settled inheritance proof changed");
+        addInheritedField(row,f,parent,parent,source,same);
     }
 }
 inline void planInheritedFields(Json& row,const Json& enabled,const Json& frozenInheritance,const Json& projectedInheritance,
     const std::function<Json(const std::string&,const std::string&)>& read,
     const std::function<Json(const Json&)>& calculate,const std::function<bool(const std::string&)>& canCopyAttack,
-    const InheritanceContext* context=nullptr) {
+    const InheritanceContext* context=nullptr,const FieldEquality& same=identicalField) {
     auto k=row["npc"].get<std::string>();if(!frozenInheritance.contains(k))return;
     const auto& old=frozenInheritance.at(k);const auto& now=projectedInheritance.at(k);
     // Scoped to this NPC: the parent-first caller may commit graph changes between NPCs.
@@ -271,17 +271,17 @@ inline void planInheritedFields(Json& row,const Json& enabled,const Json& frozen
             const auto& source=provider(bit,true);
             const auto& actual=oldValues.at(f);
             const auto& original=oldSource!=k?frozenInheritance.at(oldSource).at("values").at(f):actual;
-            bool oldCopied=oldSource!=k&&actual==original;
+            bool oldCopied=oldSource!=k&&same(f,actual,original);
             const auto local=selected.find(f);bool hasLocal=local!=selected.end()&&local->at("status")=="ready";
             if(source==k) {
                 if(oldSource==k)continue;
                 if(!hasLocal && !diskValues.contains(f)){row["inheritance_notes"][f]="Local value unavailable after detaching template";continue;}
                 const auto& value=hasLocal?local->at("expected"):diskValues.at(f);
-                if(oldCopied)addInheritedField(row,f,value,original,k);
+                if(oldCopied)addInheritedField(row,f,value,original,k,same);
                 continue;
             }
             auto value=read(source,f);
-            bool changedSource=source!=oldSource||value!=original;
+            bool changedSource=source!=oldSource||!same(f,value,original);
             if(!hasLocal&&!changedSource)continue;
             if(f=="AttackRace"||f=="AttackData") {
                 if(!canCopyAttack(source)) {row["inheritance_notes"][f]="Race-default attack map retained for child race";if(hasLocal){row["fields"][f]["status"]="skipped";row["fields"][f]["reason"]="Inherited attack map uses race default; child race retained";}continue;}
@@ -289,7 +289,7 @@ inline void planInheritedFields(Json& row,const Json& enabled,const Json& frozen
             // A parent's actual verified contents supersede the child's local copy.
             // Never accept an unexplained child runtime modification as a baseline.
             const Json nullValue;auto diskIt=diskValues.find(f);const auto& disk=diskIt==diskValues.end()?nullValue:*diskIt;
-            if(oldCopied || actual==disk || actual==value) addInheritedField(row,f,value,oldCopied?original:disk,source);
+            if(oldCopied || same(f,actual,disk) || same(f,actual,value)) addInheritedField(row,f,value,oldCopied?original:disk,source,same);
             else {row["inheritance_notes"][f]="Runtime value differs from old inherited contents; preserved";
                 if(hasLocal)row["fields"][f]["status"]="skipped",row["fields"][f]["reason"]="Unexplained runtime change during inheritance synchronization";}
         } catch(const std::exception& ex) {
@@ -321,8 +321,14 @@ inline void planInheritedFields(Json& row,const Json& enabled,const Json& frozen
                 else if(changed)row["inheritance_notes"][f]="Unexplained automatic-stat value; retained";
             }
         }catch(const std::exception& ex){row["inheritance_notes"]["automatic_stats"]=ex.what();
-            // Do not alter inputs if we cannot compute the dependent automatic values.
-            for(auto& [f,spec]:row["fields"].items())if(std::find(nbb::statInputs.begin(),nbb::statInputs.end(),f)!=nbb::statInputs.end()||nbb::calculatedField(f)){spec["status"]="skipped";spec["reason"]="Automatic calculation unavailable or unrelated runtime change";}}
+            // A derived-value calculation failure does not veto valid source inputs.
+            for(const auto* f:{"SkillValues","Health","Magicka","Stamina"})if(fields.contains(f)&&
+                (changed||row["fields"].contains(f))&&!(row.contains("input_errors")&&row["input_errors"].contains(f))) {
+                if(!row["fields"].contains(f))row["fields"][f]={{"baseline",nullptr},{"official_baseline",nullptr},{"disk",nullptr},
+                    {"expected",nullptr},{"sources",Json::array()},{"differs",false}};
+                row["fields"][f]["status"]="calculation_error";row["fields"][f]["reason"]=std::string(ex.what());
+            }
+        }
     } else {
         // Leaving automatic stats restores local or inherited caches, but only
         // when the previous calculated value can be reproduced independently.

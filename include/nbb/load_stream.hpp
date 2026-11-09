@@ -65,7 +65,7 @@ template<class Read> Payload capture(std::uintptr_t address,Read&& read) {
             resident(std::uint64_t(out.fileOffset)+24,&declared,4) && declared==0) {
             out.bytes.clear();out.source="empty_inactive_record";out.complete=true;return out;
         }
-        out.error="Decompressed NPC buffer unavailable or exceeds limit";return out;
+        out.error="Decompressed NPC buffer unavailable: buffer="+std::to_string(ptr)+"; bytes="+std::to_string(count)+"; capture_limit="+std::to_string(maxPayload)+"; compressed_record_bytes="+std::to_string(out.recordSize);return out;
     }
     if(out.recordSize>maxPayload) {out.error="NPC payload exceeds limit";return out;}
     if(!out.recordSize && (out.flags&(0x20|0x1000))) {
@@ -74,6 +74,6 @@ template<class Read> Payload capture(std::uintptr_t address,Read&& read) {
     out.bytes.resize(out.recordSize);
     if(resident(std::uint64_t(out.fileOffset)+24,out.bytes.data(),out.bytes.size())) {out.complete=true;return out;}
     out.bytes.clear();
-    out.error="Plain NPC is not fully resident in an engine buffer";return out;
+    out.error="Plain NPC is not fully resident in an engine buffer: file_offset="+std::to_string(out.fileOffset)+"; payload_bytes="+std::to_string(out.recordSize)+"; file_memory_bytes="+std::to_string(word<std::uint32_t>(file,0x20));return out;
 }
 }

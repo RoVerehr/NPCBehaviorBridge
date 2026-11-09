@@ -1,6 +1,6 @@
 # Building NPC Behavior Bridge
 
-This checkout contains the production source for version 0.6.6. The C++ source, headers and CMake build definitions match the development version. It builds without the private development directory, Skyrim files, an MO2 profile or local test fixtures.
+This checkout contains the production source for version 0.7.1. The C++ source, headers and CMake build definitions match the development version. It builds without the private development directory, Skyrim files, an MO2 profile or local test fixtures.
 
 ## Tools
 

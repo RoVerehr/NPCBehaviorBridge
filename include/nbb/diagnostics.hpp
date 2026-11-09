@@ -77,6 +77,8 @@ inline NpcResult npcResult(const Json& row) {
             skipped[reason] += field;
         }
     }
+    if(row.contains("input_errors"))for(const auto& [field,errors]:row.at("input_errors").items())
+        for(const auto& error:errors)result.errors.push_back(field+": "+error.get<std::string>());
     if (isError(status) && result.errors.empty()) result.errors.push_back(status);
     std::ostringstream text;
     text << "NPC " << row.value("editor_id", std::string()) << " [" << row.at("npc").get<std::string>() << "]: ";

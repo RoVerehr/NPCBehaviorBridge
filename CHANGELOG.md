@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.7.1
+
+- Fix repeated AI package references stopping restoration.
+- Preserve the selected source list order and every repeated entry.
+- Remove unnecessary content and size restrictions without changing the restoration rules.
+- Isolate errors per field so other fields and NPCs can still be processed.
+- Add detailed input, restoration, and load-capture fallback errors to logs and debug reports.
+
 ## 0.7
 
 - Reduce startup overhead by capturing NPC records during the game's own loading and sharing one recovery plan.

@@ -1,4 +1,4 @@
-# NPC Behavior Bridge 0.7
+# NPC Behavior Bridge 0.7.1
 
 NPC Behavior Bridge is an SKSE plugin that restores selected NPC base-record gameplay changes when later plugins revert them to baseline values.
 
@@ -12,7 +12,9 @@ It does not invent schedules or combat behavior. AI Overhaul and USSEP are optio
 
 The plugin handles enabled gameplay fields, template inheritance, related stat calculation and supported script attachments. It protects appearance, race, voice and outfits; restoring a gameplay template may change an inherited name. NPC input is captured from the game's existing loading buffers. One complete plan is shared by early initialization and the remaining DataLoaded recovery; the successful path does not scan plugin files a second time. Subsequent save/load, waiting and location checks do not repeatedly force the values back.
 
-This repository contains the source corresponding to **0.7**, build instructions, pinned dependency submodules and license notices. Local test fixtures, game data, sampling reports, deployment paths, runtime configuration and binary packages are not included. Use the configuration files supplied with the matching mod release.
+This repository contains the source corresponding to **0.7.1**, build instructions, pinned dependency submodules and license notices. Local test fixtures, game data, sampling reports, deployment paths, runtime configuration and binary packages are not included. Use the configuration files supplied with the matching mod release.
+
+Lists retain the selected source's entry order and every repeated occurrence. Spell, leveled-spell and shout entries keep their relative order within the engine's separate arrays. Input, restoration and verification errors are isolated per field, so other fields and NPCs can continue. Unreadable field history is reported without selecting guessed or earlier replacement values. Load-capture fallback reports include the specific failed observations and retain the same selection rules.
 
 The player is always excluded. Set `"debug": true` in the release configuration to generate detailed diagnostics and `NPCBehaviorBridge-report.html`, a searchable startup snapshot in the SKSE log directory. Debug mode is off by default; normal logging retains per-NPC outcomes and errors. Each game launch replaces the log and clears old diagnostic reports.
 

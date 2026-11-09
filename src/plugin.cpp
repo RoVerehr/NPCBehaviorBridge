@@ -96,17 +96,31 @@ void writeScalar(RE::TESNPC* npc,const nbb::ScalarField& f,const Json& value) {
     auto wanted=nbb::encodeScalarWord(f,readWord(ptr,f.runtimeBytes),value);
     std::memcpy(ptr,&wanted,f.runtimeBytes);
 }
+Json runtimeFieldValue(std::string_view field,const Json& value) {
+    if(field!="SPLO")return value;
+    return nbb::spellRuntimeOrder(value,[](const Json& key)->unsigned {
+        auto* form=resolve(key,RE::FormType::None);require(form,"Null spell entry");
+        switch(form->GetFormType()) {
+            case RE::FormType::Spell:return 0;
+            case RE::FormType::LeveledSpell:return 1;
+            case RE::FormType::Shout:return 2;
+            default:throw std::runtime_error("Invalid native spell-list reference type");
+        }
+    });
+}
+bool sameRuntimeField(std::string_view field,const Json& a,const Json& b) {
+    return a==b || (field=="SPLO" && runtimeFieldValue(field,a)==runtimeFieldValue(field,b));
+}
 Json readPerks(RE::TESNPC* npc) {
-    require(npc->perkCount<=4096 && (!npc->perkCount||npc->perks),"Invalid perk array");Json a=Json::array();
-    for(unsigned i=0;i<npc->perkCount;++i) {auto& e=npc->perks[i];require(e.perk,"Null perk");a.push_back(Json::array({keyOf(e.perk),int(e.currentRank)}));}std::sort(a.begin(),a.end());return a;
+    require((!npc->perkCount||npc->perks),"Invalid perk array");Json a=Json::array();
+    for(unsigned i=0;i<npc->perkCount;++i) {auto& e=npc->perks[i];require(e.perk,"Null perk");a.push_back(Json::array({keyOf(e.perk),int(e.currentRank)}));}return a;
 }
 Json readKeywords(RE::TESNPC* npc) {
-    require(npc->numKeywords<=4096 && (!npc->numKeywords||npc->keywords),"Invalid keywords");Json a=Json::array();
-    for(unsigned i=0;i<npc->numKeywords;++i) {require(npc->keywords[i],"Null keyword");a.push_back(keyOf(npc->keywords[i]));}std::sort(a.begin(),a.end());return a;
+    require((!npc->numKeywords||npc->keywords),"Invalid keywords");Json a=Json::array();
+    for(unsigned i=0;i<npc->numKeywords;++i) {require(npc->keywords[i],"Null keyword");a.push_back(keyOf(npc->keywords[i]));}return a;
 }
 Json readAttacks(RE::TESNPC* npc) {
     Json result=Json::object();auto* map=npc->attackDataMap.get();if(!map)return result;
-    require(map->attackDataMap.size()<=4096,"Excessive attack data");
     for(auto& [event,p]:map->attackDataMap) {
         require(bool(p),"Null attack data");const auto& d=p->data;
         result[event.c_str()]={{"damage_mult",d.damageMult},{"chance",d.attackChance},{"spell",reference(d.attackSpell)},{"flags",d.flags.underlying()},
@@ -140,17 +154,17 @@ Json readField(RE::TESNPC* npc,const std::string& field) {
     if(field=="CombatStyle") return reference(npc->combatStyle);
     if(field=="SkillValues") return std::vector<std::uint8_t>(std::begin(npc->playerSkills.values),std::end(npc->playerSkills.values));
     if(field=="Factions") {
-        require(npc->factions.size()<=4096,"Excessive runtime factions");Json result=Json::array();
+        Json result=Json::array();
         for(auto& entry:npc->factions) {require(entry.faction,"Null faction");result.push_back(Json::array({keyOf(entry.faction),int(entry.rank)}));}
-        std::sort(result.begin(),result.end());return result;
+        return result;
     }
     if(field=="Inventory") {
-        require(npc->numContainerObjects<=4096 && (!npc->numContainerObjects||npc->containerObjects),"Invalid runtime inventory");
+        require((!npc->numContainerObjects||npc->containerObjects),"Invalid runtime inventory");
         Json result=Json::array();for(std::uint32_t i=0;i<npc->numContainerObjects;++i) {
             auto* item=npc->containerObjects[i];require(item&&item->obj,"Null inventory entry");
             result.push_back({{"item",keyOf(item->obj)},{"count",item->count},{"extra",containerExtra(item->itemExtra)}});
         }
-        std::sort(result.begin(),result.end());return result;
+        return result;
     }
     if(field=="Magicka") return npc->playerSkills.magicka;
     if(field=="Stamina") return npc->playerSkills.stamina;
@@ -159,18 +173,18 @@ Json readField(RE::TESNPC* npc,const std::string& field) {
         auto* data=npc->actorEffects;
         if(data) {
             auto add=[&](auto** forms,std::uint32_t count) {
-                require(count<=4096 && (!count||forms),"Invalid spell array");
+                require((!count||forms),"Invalid spell array");
                 for(std::uint32_t i=0;i<count;++i) {require(forms[i],"Null spell entry");keys.push_back(keyOf(forms[i]));}
             };
             add(data->spells,data->numSpells);add(data->levSpells,data->numlevSpells);add(data->shouts,data->numShouts);
         }
-        require(keys.size()<=4096,"Excessive combined spell list");
-        std::ranges::sort(keys); keys.erase(std::unique(keys.begin(),keys.end()),keys.end()); return keys;
+        return keys;
     }
     if(field=="PKID") {
-        Json result=Json::array(); unsigned count=0;
-        for(auto* package:npc->aiPackages.packages) {
-            require(++count<=4096 && package,"Invalid runtime package list"); result.push_back(keyOf(package));
+        Json result=Json::array();std::set<const void*> seen;
+        for(auto it=npc->aiPackages.packages.begin();it!=npc->aiPackages.packages.end();++it) {
+            require(seen.insert(std::addressof(*it)).second,"Cyclic runtime package list");
+            auto* package=*it;require(package,"Null runtime package reference");result.push_back(keyOf(package));
         }
         return result;
     }
@@ -460,7 +474,7 @@ void freezeInheritance(const std::set<std::string>& only) {
             try {
                 if(nbb::needsNativeFallback(row,automatic,inheritanceContext->frozen,inheritanceContext->projected,
                     [](const std::string& k,const std::string& f){return frozenField(k,f);},
-                    [](const std::string& k){auto* parent=inheritanceObjects.at(k);return !parent->race||parent->attackDataMap!=parent->race->attackDataMap;}))pending.insert(key);
+                    [](const std::string& k){auto* parent=inheritanceObjects.at(k);return !parent->race||parent->attackDataMap!=parent->race->attackDataMap;},sameRuntimeField))pending.insert(key);
             }catch(const std::exception&){pending.insert(key);} // Original full path retains the diagnostic.
         }
         seedCount=pending.size();auto work=nbb::remainingInheritanceWork(pending,frozenInheritance,projectedInheritance);
@@ -485,7 +499,7 @@ Json providerValue(const std::string& key,const std::string& field,bool apply) {
         const auto& parent=plan["npcs"][inheritanceRows.at(key)];
         if(!apply&&parent.contains("field_results")&&parent["field_results"].contains(field)) {
             auto status=parent["field_results"][field].value("status",std::string());
-            if(status=="audit_needs_changes"||status=="audit_already_matches")return parent["fields"][field]["expected"];
+            if(status=="audit_needs_changes"||status=="audit_already_matches")return runtimeFieldValue(field,parent["fields"][field]["expected"]);
         }
         return readField(inheritanceObjects.at(key),field);
     });
@@ -496,7 +510,7 @@ void settleNativeFields(Json& row) {
     const bool automatic=npc->actorData.actorBaseFlags.all(RE::ACTOR_BASE_DATA::Flag::kAutoCalcStats);
     nbb::settleInheritedFields(row,automatic,inheritanceContext->frozen,
         [](const std::string& k,const std::string& f){return frozenField(k,f);},
-        [](const std::string& k){auto* parent=inheritanceObjects.at(k);return !parent->race||parent->attackDataMap!=parent->race->attackDataMap;});
+        [](const std::string& k){auto* parent=inheritanceObjects.at(k);return !parent->race||parent->attackDataMap!=parent->race->attackDataMap;},sameRuntimeField);
 }
 void planInheritedFields(Json& row,bool apply) {
     auto key=row.at("npc").get<std::string>();if(!inheritanceObjects.contains(key))return;
@@ -504,7 +518,7 @@ void planInheritedFields(Json& row,bool apply) {
     if(nativeFallbackScope.contains(key))nbb::planInheritedFields(row,plan.at("enabled_fields"),frozenInheritance,projectedInheritance,
         [&](const std::string& k,const std::string& f){return providerValue(k,f,apply);},
         [&](const Json& values){return statPrediction(npc,values);},
-        [&](const std::string& k){auto* parent=inheritanceObjects.at(k);return !parent->race || parent->attackDataMap!=parent->race->attackDataMap;},inheritanceContext.get());
+        [&](const std::string& k){auto* parent=inheritanceObjects.at(k);return !parent->race || parent->attackDataMap!=parent->race->attackDataMap;},inheritanceContext.get(),sameRuntimeField);
     else if(selectiveNativeWork)settleNativeFields(row);
     else return;
     if(std::find(plan["enabled_fields"].begin(),plan["enabled_fields"].end(),Json("VMAD"))!=plan["enabled_fields"].end()) try {
@@ -522,13 +536,13 @@ void planInheritedFields(Json& row,bool apply) {
     }catch(const std::exception& ex){row["inheritance_notes"]["VMAD"]=ex.what();if(row["fields"].contains("VMAD")){row["fields"]["VMAD"]["status"]="skipped";row["fields"]["VMAD"]["reason"]="Unresolved inherited VMAD";}}
 }
 
-void prepareAndApply(Json& row,bool apply) {
+void prepareAndApplyField(Json& row,bool apply) {
     if(row.at("status")!="ready") return;
     auto* npc=static_cast<RE::TESNPC*>(resolve(row.at("npc"),RE::FormType::NPC));
     if(npc->GetFormID()==0x7) {row["runtime_status"]="skipped_player";row["reason"]="Player base record is always excluded";return;}
     const auto& fields=row.at("fields");Json before=Json::object(),results=Json::object(),normalizations=Json::object();ActiveFields active;
     for(auto& [field,spec]:fields.items()) {
-        if(spec.at("status")!="ready") {results[field]={{"status","skipped_plan"},{"reason",spec.at("reason")}};continue;}
+        if(spec.at("status")!="ready") {results[field]={{"status",nbb::diagnostics::isError(spec.at("status"))?spec.at("status"):Json("skipped_plan")},{"reason",spec.at("reason")}};continue;}
         if(field=="VMAD") {results[field]={{"status","pending_actor_binding"},{"reason","Separate Actor-instance adapter; see script binding reports"}};continue;}
         if(field=="Template" && nbb::templateSharedWithProtectedData(npc->actorData.templateUseFlags.underlying())) {
             results[field]={{"status","skipped_shared_template"},{"reason","Runtime template shared with appearance (Use Traits)"}};continue;
@@ -546,9 +560,9 @@ void prepareAndApply(Json& row,bool apply) {
                     defaultFill=nbb::isDefaultCombatStyleFill(field,spec.at("disk"),actual,reference(defaultStyle));
                 if(defaultFill) normalizations[field]={{"reason","engine_default_for_unspecified"},{"actual",actual},{"disk_equivalent",nullptr}};
             }
-            bool inheritedFill=spec.contains("inherited_old_value") && actual==spec.at("inherited_old_value");
+            bool inheritedFill=spec.contains("inherited_old_value") && sameRuntimeField(field,actual,spec.at("inherited_old_value"));
             if(inheritedFill) normalizations[field]={{"reason","verified_old_inherited_or_calculated_value"},{"actual",actual}};
-            if(actual!=spec.at("disk") && actual!=spec.at("expected") && !defaultFill && !inheritedFill) results[field]={{"status","skipped_runtime_conflict"},{"actual",actual}};
+            if(!sameRuntimeField(field,actual,spec.at("disk")) && !sameRuntimeField(field,actual,spec.at("expected")) && !defaultFill && !inheritedFill) results[field]={{"status","skipped_runtime_conflict"},{"actual",actual}};
             else active[field]=&spec;
         } catch(const std::exception& e) {results[field]={{"status","read_error"},{"reason",e.what()}};}
     }
@@ -564,7 +578,7 @@ void prepareAndApply(Json& row,bool apply) {
     for(auto& [field,specPointer]:active) {
         const auto& spec=*specPointer;
         try {
-            const auto& expected=spec.at("expected");bool changed=before[field]!=expected;
+            const auto& expected=spec.at("expected");bool changed=!sameRuntimeField(field,before[field],expected);
             if(field=="InheritedName" || field=="InheritedShortName") {
                 if(apply&&changed)inheritedNames.emplace(field,expected.get<std::string>().c_str());
             } else if(const auto* f=nbb::scalarField(field)) {
@@ -627,7 +641,7 @@ void prepareAndApply(Json& row,bool apply) {
     }
     if(active.empty()) {row["runtime_status"]=results.contains("VMAD") && results["VMAD"]["status"]=="pending_actor_binding"?"pending_actor_binding":"skipped_all_fields";row["field_results"]=std::move(results);row["runtime_before"]=std::move(before);return;}
     row["runtime_before"]=std::move(before);
-    const bool needsWrite=std::any_of(active.begin(),active.end(),[&](const auto& e){return row["runtime_before"].at(e.first)!=e.second->at("expected");});
+    const bool needsWrite=std::any_of(active.begin(),active.end(),[&](const auto& e){return !sameRuntimeField(e.first,row["runtime_before"].at(e.first),e.second->at("expected"));});
     const auto protectedBefore=needsWrite?protectedBytes(npc,active):Snapshot{};
     // Each complete replacement is allocated before committing any eligible field.
     if(apply&&needsWrite) {
@@ -678,21 +692,57 @@ void prepareAndApply(Json& row,bool apply) {
     Json after=Json::object(),descriptors;bool matches=true;
     for(auto& [field,specPointer]:active) {
         const auto& spec=*specPointer;
-        after[field]=readField(npc,field);bool match=after[field]==spec.at("expected");matches&=match;
+        after[field]=readField(npc,field);bool match=sameRuntimeField(field,after[field],spec.at("expected"));matches&=match;
         results[field]={{"status",apply?(match?"applied_verified":"apply_mismatch"):(match?"audit_already_matches":"audit_needs_changes")}};
         if(debugOutput) {
             auto d=descriptor(npc,field);
-            if(!d.is_null()) {d["expected"]=spec.at("expected");d["baseline"]=after[field];descriptors[field]=std::move(d);}
+            if(!d.is_null()) {d["expected"]=runtimeFieldValue(field,spec.at("expected"));d["baseline"]=after[field];
+                if(d["expected"]!=spec.at("expected"))d["serialized_expected"]=spec.at("expected");descriptors[field]=std::move(d);}
             else results[field]["external_sampling"]="not_exported; verified by native reader";
         }
     }
     bool partial=active.size()!=fields.size();row["field_results"]=std::move(results);row["runtime_after"]=std::move(after);
     row["runtime_status"]=partial?(apply?"partial_apply":"partial_audit"):
         apply?(matches?"applied_verified":"apply_mismatch"):(matches?"audit_already_matches":"audit_needs_changes");
-    if(!descriptors.empty()) layout["npcs"].push_back({{"npc",row.at("npc")},{"editor_id",row.at("editor_id")},{"address",address(npc)},
-        {"identity_address",address(&npc->formID)},{"form_id",npc->GetFormID()}});
-    if(!descriptors.empty())layout["npcs"].back()["fields"]=std::move(descriptors);
+    if(!descriptors.empty())row["sampling_entry"]={{"npc",row.at("npc")},{"editor_id",row.at("editor_id")},{"address",address(npc)},
+        {"identity_address",address(&npc->formID)},{"form_id",npc->GetFormID()},{"fields",std::move(descriptors)}};
     require(!apply||matches,"Immediate post-write verification failed");
+}
+
+// A preparation, commit or readback error belongs to exactly this field.
+// Shared native objects (for example attack maps) preserve their other contents.
+void prepareAndApply(Json& row,bool apply) {
+    if(row.at("status")!="ready")return;
+    Json results=Json::object(),before=Json::object(),after=Json::object(),normalizations=Json::object(),sampling;
+    bool protectedEqual=true;
+    for(const auto& [field,spec]:row.at("fields").items()) {
+        Json isolated={{"npc",row.at("npc")},{"editor_id",row.at("editor_id")},{"status","ready"},{"fields",{{field,spec}}}};
+        try {prepareAndApplyField(isolated,apply);}
+        catch(const std::exception& e) {
+            if(!isolated.contains("field_results")||!isolated["field_results"].contains(field)||
+                !nbb::diagnostics::isError(isolated["field_results"][field].value("status",std::string())))
+                isolated["field_results"][field]={{"status","apply_error"},{"reason",e.what()}};
+            else isolated["field_results"][field]["reason"]=e.what();
+        }
+        if(isolated.contains("field_results")) {
+            for(auto& [name,result]:isolated["field_results"].items())if(nbb::diagnostics::isError(result.value("status",std::string())))
+                result["reason"]="phase=runtime; plugin="+row.value("winner",std::string())+"; npc="+row.at("npc").get<std::string>()+
+                    "; field="+name+"; sources="+spec.value("sources",Json::array()).dump()+"; reason="+result.value("reason",std::string());
+            results.update(isolated["field_results"]);
+        }
+        for(auto [name,target]:{std::pair{"runtime_before",&before},{"runtime_after",&after},{"runtime_normalizations",&normalizations}})
+            if(isolated.contains(name))target->update(isolated[name]);
+        protectedEqual&=isolated.value("non_target_object_bytes_unchanged",true);
+        if(isolated.contains("sampling_entry")) {
+            auto entry=std::move(isolated["sampling_entry"]);
+            if(sampling.is_null())sampling=std::move(entry);else sampling["fields"].update(entry["fields"]);
+        }
+    }
+    row["field_results"]=std::move(results);row["runtime_before"]=std::move(before);row["runtime_after"]=std::move(after);
+    row["non_target_object_bytes_unchanged"]=protectedEqual;
+    if(!normalizations.empty())row["runtime_normalizations"]=std::move(normalizations);
+    row["runtime_status"]=apply?"partial_apply":"partial_audit";
+    if(!sampling.is_null())layout["npcs"].push_back(std::move(sampling));
 }
 
 void debugReport(const char* name,const Json& data,bool append=false) {
@@ -708,12 +758,17 @@ void verify(const std::string& phase) {
         try {
             auto* npc=static_cast<RE::TESNPC*>(resolve(row.at("npc"),RE::FormType::NPC));
             for(auto& [field,baseline]:row.at("runtime_after").items()) {
+                try {
                 const auto& spec=row.at("fields").at(field);
                 auto actual=readField(npc,field); ++checked;
                 if(actual!=baseline) {
                     ++failures;
                     if(debugOutput) rows.push_back({{"npc",row.at("npc")},{"field",field},{"baseline",baseline},{"actual",actual},{"expected",spec.at("expected")}});
                     if(phase=="data_loaded") SKSE::log::error("Startup verification mismatch: NPC {} field {}; expected={}, actual={}",row.at("npc").get<std::string>(),field,baseline.dump(),actual.dump());
+                }
+                }catch(const std::exception& e) {
+                    ++failures;rows.push_back({{"npc",row.at("npc")},{"field",field},{"error",e.what()}});
+                    SKSE::log::error("Verification {}: npc={}; field={}; reason={}; other fields continue",phase,row.at("npc").get<std::string>(),field,e.what());
                 }
             }
         } catch(const std::exception& e) {
@@ -766,6 +821,7 @@ void initialize() {
     const bool reusedCapturedPlan=capturedPlan.has_value();
     if(reusedCapturedPlan)plan=std::move(*capturedPlan);
     else plan=nbb::run(manifest,config,exclusions,&coreTimings);
+    {auto details=nbb::load_capture::diagnosticSummary();if(plan.contains("load_capture"))plan["load_capture"].update(details);else plan["load_capture"]=std::move(details);}
     timing(reusedCapturedPlan?"captured_plan_handoff":"disk_fallback_core");
     nbb::load_capture::releasePlan();
     timing("capture_plan_release");
@@ -805,7 +861,7 @@ void initialize() {
             if(!parent.is_null()&&inheritanceRows.contains(parent.get<std::string>())) process(parent.get<std::string>());
         }
         if(inheritanceScope.contains(k)) {
-            planInheritedFields(row,apply);
+            try {planInheritedFields(row,apply);}catch(const std::exception& e){row["inheritance_error"]=e.what();}
             try {prepareAndApply(row,apply);} catch(const std::exception& e) {row["runtime_status"]="error";row["runtime_error"]=e.what();SKSE::log::error("{}: {}",k,e.what());}
             // Descendants use only the relationship that was actually committed.
             if(apply&&inheritanceObjects.contains(k)&&(!selectiveNativeWork||nativeFallbackScope.contains(k))) {auto* npc=inheritanceObjects.at(k);auto parent=reference(npc->baseTemplateForm);auto flags=npc->actorData.templateUseFlags.underlying();projectedInheritance[k]["template"]=parent;projectedInheritance[k]["flags"]=flags;inheritanceContext->projected.update(k,flags,parent);}
@@ -890,7 +946,7 @@ void message(SKSE::MessagingInterface::Message* msg) {
 }
 }
 extern "C" __declspec(dllexport) constinit SKSE::PluginVersionData SKSEPlugin_Version=[] {
-    SKSE::PluginVersionData v; v.PluginVersion({0,7,0,0}); v.PluginName("NPCBehaviorBridge"); v.AuthorName("ROSVER");
+    SKSE::PluginVersionData v; v.PluginVersion({0,7,1,0}); v.PluginName("NPCBehaviorBridge"); v.AuthorName("ROSVER");
     // As in WingFlight: generic/version-selected struct support, not the
     // post-629-only flag (older AE SKSE rejects that bit). V5 is set by CLib.
     v.UsesAddressLibrary(); v.UsesNoStructs();
@@ -900,7 +956,7 @@ extern "C" __declspec(dllexport) constinit SKSE::PluginVersionData SKSEPlugin_Ve
 }();
 extern "C" __declspec(dllexport) bool SKSEPlugin_Query(const SKSE::QueryInterface* skse,SKSE::PluginInfo* info) {
     if(!skse || !info) return false;
-    info->infoVersion=SKSE::PluginInfo::kVersion; info->name="NPCBehaviorBridge"; info->version=REL::Version(0,7,0,0).pack();
+    info->infoVersion=SKSE::PluginInfo::kVersion; info->name="NPCBehaviorBridge"; info->version=REL::Version(0,7,1,0).pack();
     auto v=skse->RuntimeVersion();
     return !skse->IsEditor() && nbb::runtime::selectSKSE(v[0],v[1],v[2],v[3]);
 }
@@ -916,7 +972,7 @@ extern "C" __declspec(dllexport) bool SKSEPlugin_Load(const SKSE::LoadInterface*
         auto fileVersion=REL::Module::get().version();
         require(nbb::runtime::selectFile(fileVersion[0],fileVersion[1],fileVersion[2],fileVersion[3])==hostRuntime,
             "Executable file version and SKSE/store identity disagree");
-        SKSE::log::info("NPC Behavior Bridge 0.7; runtime={} store={} SKSE-store-type={} Address-Library-format={}",
+        SKSE::log::info("NPC Behavior Bridge 0.7.1; runtime={} store={} SKSE-store-type={} Address-Library-format={}",
             hostRuntime->name,hostRuntime->store==1?"GOG":"Steam",hostRuntime->store,nbb::runtime::addressFormat(*hostRuntime));
         if(!SKSE::GetMessagingInterface()->RegisterListener(message))return false;
         try {nbb::load_capture::install(*hostRuntime);}catch(const std::exception& e){SKSE::log::error("Load capture installation failed: {}; disk recovery retained",e.what());}
