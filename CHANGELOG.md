@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.7.2
+
+- Skip direct restoration for any tracked NPC field when the winning plugin already provides the selected value. The debug report identifies these fields as already provided by the winning plugin.
+- Fix a crash during Draugr combat with the Unofficial Skyrim Modder's Patch (USMP). When a later plugin overrides an intentionally unspecified combat style, Bridge now restores the game's current default combat style.
+
 ## 0.7.1
 
 - Fix repeated AI package references stopping restoration.

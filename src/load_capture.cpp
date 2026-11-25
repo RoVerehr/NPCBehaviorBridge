@@ -4,6 +4,7 @@
 #include "nbb/field_catalog.hpp"
 #include "nbb/inheritance.hpp"
 #include "nbb/runtime_normalization.hpp"
+#include "nbb/combat_style.hpp"
 #include <Windows.h>
 #include <array>
 #include <atomic>
@@ -388,10 +389,18 @@ void earlyApplyImpl(RE::TESNPC* npc,EarlyEnvironment& env,const Json& input) {
         if(spec.at("status")!="ready"){store("Candidate contains skipped fields; transaction not applied");return;}
         actual[f]=fieldValue(before,f);
         bool allowed=permitsValue(actual[f],spec);
-        if(!allowed&&f=="CombatStyle"){auto* m=RE::BGSDefaultObjectManager::GetSingleton();auto* d=m?m->objects[std::to_underlying(RE::DEFAULT_OBJECT::kCombatStyle)]:nullptr;
-            if(d&&d->GetFormType()==RE::FormType::CombatStyle&&!d->IsDeleted())allowed=isDefaultCombatStyleFill(f,spec.at("disk"),actual[f],env.key(d->formID));}
-        if(!allowed){result["runtime_before"]=actual;store("Unknown runtime change; regular recovery retained");return;}
         desired[f]=spec.at("expected");
+        if(f=="CombatStyle" && (spec.at("disk").is_null() || desired[f].is_null())) {
+            auto* style=nbb::defaultCombatStyle();
+            const Json engineDefault=style?env.key(style->formID):Json(nullptr);
+            allowed|=isDefaultCombatStyleFill(f,spec.at("disk"),actual[f],engineDefault);
+            if(desired[f].is_null()) {
+                if(!style){store("Engine default CombatStyle unavailable; regular recovery retained");return;}
+                desired[f]=engineDefault;
+                allowed=actual[f]==spec.at("disk") || actual[f]==engineDefault;
+            }
+        }
+        if(!allowed){result["runtime_before"]=actual;store("Unknown runtime change; regular recovery retained");return;}
         auto resolve=[&](const Json& v,RE::FormType t){if(v.is_null())return static_cast<RE::TESForm*>(nullptr);auto* p=lookup(env.ids.at(v.get<std::string>()));need(p&&p->GetFormType()==t&&!p->IsDeleted()&&env.key(p->formID)==v,"Early target reference failed validation");return p;};
         if(actual[f]==desired[f])continue;
         if(f=="PKID"){for(auto it=desired[f].rbegin();it!=desired[f].rend();++it){auto* p=resolve(*it,RE::FormType::Package);need(p,"Null early package");replacement.push_front(static_cast<RE::TESPackage*>(p));}packagesChanged=true;allow(0xC8,16);}

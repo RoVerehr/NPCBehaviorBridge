@@ -62,7 +62,8 @@ inline NpcResult npcResult(const Json& row) {
         const auto state = entry.value("status", status);
         if (isError(state)) {
             result.errors.push_back(field + ": " + state + "; " + entry.value("reason", std::string("post-write mismatch")));
-        } else if (state == "applied_verified" || state == "audit_already_matches") {
+        } else if (state == "already_forwarded") ++result.unchanged;
+        else if (state == "applied_verified" || state == "audit_already_matches") {
             if (row.contains("runtime_before") && row.contains("runtime_after") &&
                 row.at("runtime_before").contains(field) && row.at("runtime_after").contains(field) &&
                 row.at("runtime_before").at(field) != row.at("runtime_after").at(field)) ++result.restored;

@@ -2,6 +2,7 @@
 #include "nbb/script_binding.hpp"
 #include "nbb/runtime_policy.hpp"
 #include "nbb/runtime_normalization.hpp"
+#include "nbb/combat_style.hpp"
 #include "nbb/field_catalog.hpp"
 #include "nbb/inheritance.hpp"
 #include "nbb/diagnostics.hpp"
@@ -499,7 +500,13 @@ Json providerValue(const std::string& key,const std::string& field,bool apply) {
         const auto& parent=plan["npcs"][inheritanceRows.at(key)];
         if(!apply&&parent.contains("field_results")&&parent["field_results"].contains(field)) {
             auto status=parent["field_results"][field].value("status",std::string());
-            if(status=="audit_needs_changes"||status=="audit_already_matches")return runtimeFieldValue(field,parent["fields"][field]["expected"]);
+            if(status=="audit_needs_changes"||status=="audit_already_matches") {
+                if(parent.contains("runtime_normalizations") && parent["runtime_normalizations"].contains(field)) {
+                    const auto& normalization=parent["runtime_normalizations"][field];
+                    if(normalization.contains("runtime_expected")) return normalization["runtime_expected"];
+                }
+                return runtimeFieldValue(field,parent["fields"][field]["expected"]);
+            }
         }
         return readField(inheritanceObjects.at(key),field);
     });
@@ -528,7 +535,7 @@ void planInheritedFields(Json& row,bool apply) {
         const auto& before=oldParent["inheritance_record"]["fields"]["VMAD"];
         const Json* value=&parent["inheritance_record"]["fields"]["VMAD"];
         if(parent["fields"].contains("VMAD")&&parent["fields"]["VMAD"]["status"]=="ready")value=&parent["fields"]["VMAD"]["expected"];
-        if(source!=oldSource||*value!=before||row["fields"].contains("VMAD")) {
+        if(source!=oldSource||*value!=before||(row["fields"].contains("VMAD")&&row["fields"]["VMAD"]["status"]=="ready")) {
             require(!value->contains("unparsed"),"Inherited VMAD is unparsed");
             nbb::addInheritedField(row,"VMAD",*value,before,source);
             row["fields"]["VMAD"]["sources"]=parent["fields"].contains("VMAD")?parent["fields"]["VMAD"]["sources"]:Json::array({parent["winner"]});
@@ -540,8 +547,12 @@ void prepareAndApplyField(Json& row,bool apply) {
     if(row.at("status")!="ready") return;
     auto* npc=static_cast<RE::TESNPC*>(resolve(row.at("npc"),RE::FormType::NPC));
     if(npc->GetFormID()==0x7) {row["runtime_status"]="skipped_player";row["reason"]="Player base record is always excluded";return;}
-    const auto& fields=row.at("fields");Json before=Json::object(),results=Json::object(),normalizations=Json::object();ActiveFields active;
+    auto& fields=row.at("fields");Json before=Json::object(),results=Json::object(),normalizations=Json::object();ActiveFields active;
     for(auto& [field,spec]:fields.items()) {
+        if(spec.at("status")=="already_forwarded") {
+            results[field]={{"status","already_forwarded"},{"reason","Winning plugin already supplies the selected value"}};
+            continue;
+        }
         if(spec.at("status")!="ready") {results[field]={{"status",nbb::diagnostics::isError(spec.at("status"))?spec.at("status"):Json("skipped_plan")},{"reason",spec.at("reason")}};continue;}
         if(field=="VMAD") {results[field]={{"status","pending_actor_binding"},{"reason","Separate Actor-instance adapter; see script binding reports"}};continue;}
         if(field=="Template" && nbb::templateSharedWithProtectedData(npc->actorData.templateUseFlags.underlying())) {
@@ -551,17 +562,23 @@ void prepareAndApplyField(Json& row,bool apply) {
         try {
             auto actual=readField(npc,field);before[field]=actual;
             bool defaultFill=false;
-            if(field=="CombatStyle" && spec.at("disk").is_null() && !actual.is_null()) {
-                auto* manager=RE::BGSDefaultObjectManager::GetSingleton();
-                // This early object slot is stable across supported SE/AE versions;
-                // validate the loaded form instead of relying on version-varying init flags.
-                auto* defaultStyle=manager?manager->objects[std::to_underlying(RE::DEFAULT_OBJECT::kCombatStyle)]:nullptr;
-                if(defaultStyle && defaultStyle->GetFormType()==RE::FormType::CombatStyle && !defaultStyle->IsDeleted())
-                    defaultFill=nbb::isDefaultCombatStyleFill(field,spec.at("disk"),actual,reference(defaultStyle));
+            if(field=="CombatStyle" && (spec.at("disk").is_null() || spec.at("expected").is_null())) {
+                const auto engineDefault=reference(nbb::defaultCombatStyle());
+                defaultFill=nbb::isDefaultCombatStyleFill(field,spec.at("disk"),actual,engineDefault);
                 if(defaultFill) normalizations[field]={{"reason","engine_default_for_unspecified"},{"actual",actual},{"disk_equivalent",nullptr}};
+                if(spec.at("expected").is_null()) {
+                    require(!engineDefault.is_null(),"Cannot restore unspecified CombatStyle: engine default unavailable");
+                    // This spec is private to the runtime adapter. Keep the source plan's ZNAM unchanged.
+                    spec["serialized_expected"]=nullptr;
+                    spec["expected"]=engineDefault;
+                    normalizations[field]["runtime_expected"]=engineDefault;
+                }
             }
             bool inheritedFill=spec.contains("inherited_old_value") && sameRuntimeField(field,actual,spec.at("inherited_old_value"));
-            if(inheritedFill) normalizations[field]={{"reason","verified_old_inherited_or_calculated_value"},{"actual",actual}};
+            if(inheritedFill) {
+                normalizations[field]["reason"]="verified_old_inherited_or_calculated_value";
+                normalizations[field]["actual"]=actual;
+            }
             if(!sameRuntimeField(field,actual,spec.at("disk")) && !sameRuntimeField(field,actual,spec.at("expected")) && !defaultFill && !inheritedFill) results[field]={{"status","skipped_runtime_conflict"},{"actual",actual}};
             else active[field]=&spec;
         } catch(const std::exception& e) {results[field]={{"status","read_error"},{"reason",e.what()}};}
@@ -697,7 +714,9 @@ void prepareAndApplyField(Json& row,bool apply) {
         if(debugOutput) {
             auto d=descriptor(npc,field);
             if(!d.is_null()) {d["expected"]=runtimeFieldValue(field,spec.at("expected"));d["baseline"]=after[field];
-                if(d["expected"]!=spec.at("expected"))d["serialized_expected"]=spec.at("expected");descriptors[field]=std::move(d);}
+                if(spec.contains("serialized_expected")) d["serialized_expected"]=spec.at("serialized_expected");
+                else if(d["expected"]!=spec.at("expected")) d["serialized_expected"]=spec.at("expected");
+                descriptors[field]=std::move(d);}
             else results[field]["external_sampling"]="not_exported; verified by native reader";
         }
     }
@@ -946,7 +965,7 @@ void message(SKSE::MessagingInterface::Message* msg) {
 }
 }
 extern "C" __declspec(dllexport) constinit SKSE::PluginVersionData SKSEPlugin_Version=[] {
-    SKSE::PluginVersionData v; v.PluginVersion({0,7,1,0}); v.PluginName("NPCBehaviorBridge"); v.AuthorName("ROSVER");
+    SKSE::PluginVersionData v; v.PluginVersion({0,7,2,0}); v.PluginName("NPCBehaviorBridge"); v.AuthorName("ROSVER");
     // As in WingFlight: generic/version-selected struct support, not the
     // post-629-only flag (older AE SKSE rejects that bit). V5 is set by CLib.
     v.UsesAddressLibrary(); v.UsesNoStructs();
@@ -956,7 +975,7 @@ extern "C" __declspec(dllexport) constinit SKSE::PluginVersionData SKSEPlugin_Ve
 }();
 extern "C" __declspec(dllexport) bool SKSEPlugin_Query(const SKSE::QueryInterface* skse,SKSE::PluginInfo* info) {
     if(!skse || !info) return false;
-    info->infoVersion=SKSE::PluginInfo::kVersion; info->name="NPCBehaviorBridge"; info->version=REL::Version(0,7,1,0).pack();
+    info->infoVersion=SKSE::PluginInfo::kVersion; info->name="NPCBehaviorBridge"; info->version=REL::Version(0,7,2,0).pack();
     auto v=skse->RuntimeVersion();
     return !skse->IsEditor() && nbb::runtime::selectSKSE(v[0],v[1],v[2],v[3]);
 }
@@ -972,7 +991,7 @@ extern "C" __declspec(dllexport) bool SKSEPlugin_Load(const SKSE::LoadInterface*
         auto fileVersion=REL::Module::get().version();
         require(nbb::runtime::selectFile(fileVersion[0],fileVersion[1],fileVersion[2],fileVersion[3])==hostRuntime,
             "Executable file version and SKSE/store identity disagree");
-        SKSE::log::info("NPC Behavior Bridge 0.7.1; runtime={} store={} SKSE-store-type={} Address-Library-format={}",
+        SKSE::log::info("NPC Behavior Bridge 0.7.2; runtime={} store={} SKSE-store-type={} Address-Library-format={}",
             hostRuntime->name,hostRuntime->store==1?"GOG":"Steam",hostRuntime->store,nbb::runtime::addressFormat(*hostRuntime));
         if(!SKSE::GetMessagingInterface()->RegisterListener(message))return false;
         try {nbb::load_capture::install(*hostRuntime);}catch(const std::exception& e){SKSE::log::error("Load capture installation failed: {}; disk recovery retained",e.what());}

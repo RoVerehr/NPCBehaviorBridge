@@ -555,7 +555,7 @@ Json makePlan(std::vector<Plugin> plugins,const Json& config,const Sequence& exc
             bool differs=final->fields.at(field)!=value;sourceNames.insert(npc->plugin);
             fields[field]={{"baseline",baseline->fields.at(field)},{"official_baseline",originalBaseline->fields.at(field)},{"disk",final->fields.at(field)},
                 {"expected",value},{"sources",Json::array({npc->plugin})},{"differs",differs},
-                {"status",fieldReason.empty()?"ready":fieldReason.starts_with("Invalid ")||fieldReason.starts_with("Unparsed ")||fieldReason.starts_with("Container ownership")?"selection_error":"skipped"},{"reason",fieldReason}};
+                {"status",fieldReason.empty()?(differs?"ready":"already_forwarded"):fieldReason.starts_with("Invalid ")||fieldReason.starts_with("Unparsed ")||fieldReason.starts_with("Container ownership")?"selection_error":"skipped"},{"reason",fieldReason}};
             if(fieldReason.empty()) {++applicable;++eligibleFields;changes+=differs;} else ++skippedFields;
         }
         for(const auto& [field,errors]:inputErrors) {

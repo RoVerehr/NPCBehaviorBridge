@@ -294,7 +294,7 @@ inline void planInheritedFields(Json& row,const Json& enabled,const Json& frozen
                 if(hasLocal)row["fields"][f]["status"]="skipped",row["fields"][f]["reason"]="Unexplained runtime change during inheritance synchronization";}
         } catch(const std::exception& ex) {
             row["inheritance_notes"][f]=ex.what();
-            if(row["fields"].contains(f)) {row["fields"][f]["status"]="skipped";row["fields"][f]["reason"]="Unresolved inheritance: "+std::string(ex.what());}
+            if(row["fields"].contains(f) && row["fields"][f]["status"]=="ready") {row["fields"][f]["status"]="skipped";row["fields"][f]["reason"]="Unresolved inheritance: "+std::string(ex.what());}
         }
     }
     // Recalculate only when accepted stat inputs change, using the child's race.
